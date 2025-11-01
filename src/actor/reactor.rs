@@ -2206,6 +2206,7 @@ impl Reactor {
     /// Update app visibility globally across all displays
     /// This ensures we make consistent hide/unhide decisions
     pub(crate) fn update_app_visibility_global(&mut self) {
+        println!("[APP_VISIBILITY] update_app_visibility_global called");
         let num_displays = self.space_manager.screens.len();
 
         // Collect all PIDs that should be visible (have windows in any active workspace)
@@ -2215,7 +2216,9 @@ impl Reactor {
         let mut all_pids = HashSet::default();
 
         for display in 0..num_displays {
-            if self.layout_manager.layout_engine.active_workspace(display).is_none() {
+            let active_workspace_id = self.layout_manager.layout_engine.active_workspace(display);
+            if active_workspace_id.is_none() {
+                println!("[APP_VISIBILITY] Display {} has no active workspace", display);
                 continue;
             }
 
@@ -2227,6 +2230,11 @@ impl Reactor {
                 .layout_engine
                 .virtual_workspace_manager()
                 .windows_in_inactive_workspaces(display);
+
+            println!("[APP_VISIBILITY] Display {} active_workspace={:?}, active_windows={:?}",
+                   display, active_workspace_id, active_windows);
+            println!("[APP_VISIBILITY] Display {} inactive_windows={:?}",
+                   display, inactive_windows);
 
             // Track all active windows globally
             for wid in &active_windows {
@@ -2241,15 +2249,21 @@ impl Reactor {
         }
 
         // Now make global hide/unhide decisions
+        println!("[APP_VISIBILITY] globally_visible_pids: {:?}", globally_visible_pids);
+        println!("[APP_VISIBILITY] pids_to_hide: {:?}", all_pids.difference(&globally_visible_pids).collect::<Vec<_>>());
 
         // Unhide all apps that should be visible
         // Check current state first to avoid unnecessary operations
         for &pid in &globally_visible_pids {
             let is_hidden = crate::sys::app::is_app_hidden(pid);
+            println!("[APP_VISIBILITY] PID {} should be visible, currently hidden={}", pid, is_hidden);
             if is_hidden {
                 tracing::trace!("Unhiding app {} (has windows in active workspace globally)", pid);
                 if let Err(e) = self.unhide_app(pid) {
+                    println!("[APP_VISIBILITY] ✗ Failed to unhide app {}: {}", pid, e);
                     tracing::warn!("Failed to unhide app {}: {}", pid, e);
+                } else {
+                    println!("[APP_VISIBILITY] ✓ Successfully unhid app {}", pid);
                 }
             } else {
                 tracing::trace!("App {} already visible, skipping unhide", pid);
@@ -2261,15 +2275,20 @@ impl Reactor {
         let pids_to_hide: Vec<_> = all_pids.difference(&globally_visible_pids).copied().collect();
         for &pid in &pids_to_hide {
             let is_hidden = crate::sys::app::is_app_hidden(pid);
+            println!("[APP_VISIBILITY] PID {} should be hidden, currently hidden={}", pid, is_hidden);
             if !is_hidden {
                 tracing::trace!("Hiding app {} (no windows in any active workspace globally)", pid);
                 if let Err(e) = self.hide_app(pid) {
+                    println!("[APP_VISIBILITY] ✗ Failed to hide app {}: {}", pid, e);
                     tracing::warn!("Failed to hide app {}: {}", pid, e);
                 } else {
                     // Verify the hide actually worked
                     let still_visible = !crate::sys::app::is_app_hidden(pid);
                     if still_visible {
+                        println!("[APP_VISIBILITY] ✗ App {} reports as still visible after hide() call - may not respect hiding", pid);
                         tracing::warn!("App {} reports as still visible after hide() call - may not respect hiding", pid);
+                    } else {
+                        println!("[APP_VISIBILITY] ✓ Successfully hid app {}", pid);
                     }
                 }
             } else {

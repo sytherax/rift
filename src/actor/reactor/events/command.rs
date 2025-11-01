@@ -18,12 +18,12 @@ impl CommandEventHandler {
         info!(?cmd);
         println!("[COMMAND] handle_command_layout: {:?}", cmd);
 
-        let visible_spaces = reactor
+        let visible_screens: Vec<_> = reactor
             .space_manager
             .screens
             .iter()
-            .flat_map(|screen| screen.space)
-            .collect::<Vec<_>>();
+            .filter_map(|screen| screen.space.map(|s| (s, screen.frame)))
+            .collect();
 
         let is_workspace_switch = matches!(
             cmd,
@@ -70,7 +70,7 @@ impl CommandEventHandler {
             }
             _ => reactor.layout_manager.layout_engine.handle_command(
                 reactor.workspace_command_space(),
-                &visible_spaces,
+                &visible_screens,
                 cmd,
             ),
         };

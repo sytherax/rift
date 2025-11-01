@@ -187,23 +187,106 @@ impl LayoutEngine {
     fn move_focus_internal(
         &mut self,
         space: SpaceId,
-        visible_spaces: &[SpaceId],
+        visible_screens: &[(SpaceId, CGRect)],
         direction: Direction,
         is_floating: bool,
     ) -> EventResponse {
         let layout = self.layout(space);
 
-        let next_space = |direction| {
-            if visible_spaces.len() <= 1 {
+        let next_space = |direction: Direction| {
+            if visible_screens.len() <= 1 {
                 return None;
             }
-            let idx = visible_spaces.iter().enumerate().find(|(_, s)| **s == space)?.0;
-            let idx = match direction {
-                Direction::Left | Direction::Up => idx as i32 - 1,
-                Direction::Right | Direction::Down => idx as i32 + 1,
-            };
-            let idx = idx.rem_euclid(visible_spaces.len() as i32);
-            Some(visible_spaces[idx as usize])
+
+            // Find current screen
+            let current_screen = visible_screens.iter().find(|(s, _)| *s == space)?;
+            let current_frame = current_screen.1;
+
+            // Find the best adjacent screen based on physical arrangement
+            let mut best_match: Option<(SpaceId, f64)> = None;
+
+            for (candidate_space, candidate_frame) in visible_screens.iter() {
+                if *candidate_space == space {
+                    continue;
+                }
+
+                // Calculate if this screen is in the desired direction
+                let current_max_x = current_frame.origin.x + current_frame.size.width;
+                let current_max_y = current_frame.origin.y + current_frame.size.height;
+                let candidate_max_x = candidate_frame.origin.x + candidate_frame.size.width;
+                let candidate_max_y = candidate_frame.origin.y + candidate_frame.size.height;
+
+                let is_candidate = match direction {
+                    Direction::Left => {
+                        // Screen should be to the left (max_x of candidate <= min_x of current)
+                        candidate_max_x <= current_frame.origin.x
+                    }
+                    Direction::Right => {
+                        // Screen should be to the right (min_x of candidate >= max_x of current)
+                        candidate_frame.origin.x >= current_max_x
+                    }
+                    Direction::Up => {
+                        // Screen should be above (max_y of candidate <= min_y of current)
+                        candidate_max_y <= current_frame.origin.y
+                    }
+                    Direction::Down => {
+                        // Screen should be below (min_y of candidate >= max_y of current)
+                        candidate_frame.origin.y >= current_max_y
+                    }
+                };
+
+                if !is_candidate {
+                    continue;
+                }
+
+                // Calculate distance (prefer closer screens)
+                let distance = match direction {
+                    Direction::Left | Direction::Right => {
+                        // Horizontal distance + vertical misalignment penalty
+                        let horiz_dist = if direction == Direction::Left {
+                            current_frame.origin.x - candidate_max_x
+                        } else {
+                            candidate_frame.origin.x - current_max_x
+                        };
+
+                        // Vertical overlap/misalignment
+                        let vert_penalty = {
+                            let current_mid_y = current_frame.origin.y + current_frame.size.height / 2.0;
+                            let candidate_mid_y = candidate_frame.origin.y + candidate_frame.size.height / 2.0;
+                            (current_mid_y - candidate_mid_y).abs()
+                        };
+
+                        horiz_dist + vert_penalty * 0.5
+                    }
+                    Direction::Up | Direction::Down => {
+                        // Vertical distance + horizontal misalignment penalty
+                        let vert_dist = if direction == Direction::Up {
+                            current_frame.origin.y - candidate_max_y
+                        } else {
+                            candidate_frame.origin.y - current_max_y
+                        };
+
+                        // Horizontal overlap/misalignment
+                        let horiz_penalty = {
+                            let current_mid_x = current_frame.origin.x + current_frame.size.width / 2.0;
+                            let candidate_mid_x = candidate_frame.origin.x + candidate_frame.size.width / 2.0;
+                            (current_mid_x - candidate_mid_x).abs()
+                        };
+
+                        vert_dist + horiz_penalty * 0.5
+                    }
+                };
+
+                if let Some((_, best_dist)) = best_match {
+                    if distance < best_dist {
+                        best_match = Some((*candidate_space, distance));
+                    }
+                } else {
+                    best_match = Some((*candidate_space, distance));
+                }
+            }
+
+            best_match.map(|(s, _)| s)
         };
 
         if is_floating {
@@ -286,12 +369,76 @@ impl LayoutEngine {
             if let Some(new_space) = next_space(direction) {
                 let new_layout = self.layout(new_space);
                 let windows_in_new_space = self.tree.visible_windows_in_layout(new_layout);
-                if let Some(&first_window) = windows_in_new_space.first() {
-                    let _ = self.tree.select_window(new_layout, first_window);
-                    return EventResponse {
-                        focus_window: Some(first_window),
-                        raise_windows: windows_in_new_space,
+
+                if !windows_in_new_space.is_empty() {
+                    // Find the screen for the new space to get its bounds
+                    let new_screen = visible_screens.iter().find(|(s, _)| *s == new_space);
+
+                    let selected_window = if let Some((_, screen_frame)) = new_screen {
+                        // Calculate positions to find the window closest to the edge we're entering from
+                        let positions = self.tree.calculate_layout(
+                            new_layout,
+                            *screen_frame,
+                            0.0,  // stack_offset
+                            &self.layout_settings.gaps,
+                            0.0,  // stack_line_thickness
+                            crate::common::config::HorizontalPlacement::Top,
+                            crate::common::config::VerticalPlacement::Left,
+                        );
+
+                        // Select window based on which edge we're entering from
+                        let best_window = match direction {
+                            Direction::Right => {
+                                // Entering from left, select leftmost window
+                                positions.iter()
+                                    .filter(|(wid, _)| windows_in_new_space.contains(wid))
+                                    .min_by(|(_, a), (_, b)| {
+                                        a.origin.x.partial_cmp(&b.origin.x).unwrap()
+                                    })
+                                    .map(|(wid, _)| *wid)
+                            }
+                            Direction::Left => {
+                                // Entering from right, select rightmost window
+                                positions.iter()
+                                    .filter(|(wid, _)| windows_in_new_space.contains(wid))
+                                    .max_by(|(_, a), (_, b)| {
+                                        a.origin.x.partial_cmp(&b.origin.x).unwrap()
+                                    })
+                                    .map(|(wid, _)| *wid)
+                            }
+                            Direction::Down => {
+                                // Entering from top, select topmost window
+                                positions.iter()
+                                    .filter(|(wid, _)| windows_in_new_space.contains(wid))
+                                    .min_by(|(_, a), (_, b)| {
+                                        a.origin.y.partial_cmp(&b.origin.y).unwrap()
+                                    })
+                                    .map(|(wid, _)| *wid)
+                            }
+                            Direction::Up => {
+                                // Entering from bottom, select bottommost window
+                                positions.iter()
+                                    .filter(|(wid, _)| windows_in_new_space.contains(wid))
+                                    .max_by(|(_, a), (_, b)| {
+                                        a.origin.y.partial_cmp(&b.origin.y).unwrap()
+                                    })
+                                    .map(|(wid, _)| *wid)
+                            }
+                        };
+
+                        best_window.or_else(|| windows_in_new_space.first().copied())
+                    } else {
+                        // Fallback to first window if we can't find the screen
+                        windows_in_new_space.first().copied()
                     };
+
+                    if let Some(window) = selected_window {
+                        let _ = self.tree.select_window(new_layout, window);
+                        return EventResponse {
+                            focus_window: Some(window),
+                            raise_windows: windows_in_new_space,
+                        };
+                    }
                 }
             }
 
@@ -619,9 +766,10 @@ impl LayoutEngine {
     pub fn handle_command(
         &mut self,
         space: Option<SpaceId>,
-        visible_spaces: &[SpaceId],
+        visible_screens: &[(SpaceId, CGRect)],
         command: LayoutCommand,
     ) -> EventResponse {
+        let visible_spaces: Vec<SpaceId> = visible_screens.iter().map(|(s, _)| *s).collect();
         if let Some(space) = space {
             let layout = self.layout(space);
             debug!("Tree:\n{}", self.tree.draw_tree(layout).trim());
@@ -746,10 +894,10 @@ impl LayoutEngine {
             }
 
             LayoutCommand::NextWindow => {
-                self.move_focus_internal(space, visible_spaces, Direction::Left, is_floating)
+                self.move_focus_internal(space, visible_screens, Direction::Left, is_floating)
             }
             LayoutCommand::PrevWindow => {
-                self.move_focus_internal(space, visible_spaces, Direction::Right, is_floating)
+                self.move_focus_internal(space, visible_screens, Direction::Right, is_floating)
             }
             LayoutCommand::MoveFocus(direction) => {
                 debug!(
@@ -757,9 +905,9 @@ impl LayoutEngine {
                     direction, is_floating
                 );
                 if is_floating {
-                    return self.move_focus_internal(space, visible_spaces, direction, true);
+                    return self.move_focus_internal(space, visible_screens, direction, true);
                 } else {
-                    return self.move_focus_internal(space, visible_spaces, direction, false);
+                    return self.move_focus_internal(space, visible_screens, direction, false);
                 }
             }
             LayoutCommand::Ascend => {
@@ -970,10 +1118,10 @@ impl LayoutEngine {
                 }
             }
 
-            // NOTE: We used to move windows from inactive workspaces to offscreen positions here.
-            // This has been removed in favor of using native app hiding (hide/unhide).
-            // Windows in inactive workspaces are now handled by hiding their apps instead of
-            // repositioning them offscreen.
+            // NOTE: We rely on app-level hiding (hide/unhide) to manage window visibility.
+            // This means apps are hidden/shown as a whole, not individual windows.
+            // Limitation: If an app has windows in both active and inactive workspaces,
+            // all windows will be visible (since the app must be unhidden for the active window).
         }
 
         positions.into_iter().collect()

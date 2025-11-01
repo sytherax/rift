@@ -31,8 +31,12 @@ impl DragEventHandler {
                     "Skipping deferred swap; one of the windows no longer exists"
                 );
             } else {
-                let visible_spaces =
-                    reactor.space_manager.screens.iter().flat_map(|s| s.space).collect::<Vec<_>>();
+                let visible_screens: Vec<_> = reactor
+                    .space_manager
+                    .screens
+                    .iter()
+                    .filter_map(|screen| screen.space.map(|s| (s, screen.frame)))
+                    .collect();
 
                 let swap_space = reactor
                     .window_manager
@@ -49,7 +53,7 @@ impl DragEventHandler {
                     .or_else(|| reactor.space_manager.screens.iter().find_map(|s| s.space));
                 let response = reactor.layout_manager.layout_engine.handle_command(
                     swap_space,
-                    &visible_spaces,
+                    &visible_screens,
                     LayoutCommand::SwapWindows(dragged_wid, target_wid),
                 );
                 reactor.handle_layout_response(response);
