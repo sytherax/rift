@@ -92,7 +92,14 @@ impl CgsWindow {
             let frame_region = CFRegion::from_rect(&frame).map_err(CgsWindowError::Region)?;
             let empty_region = CFRegion::empty();
 
-            let mut tags: u64 = (1 << 1) | (1 << 9);
+            use super::skylight::SLSWindowTags;
+            // Floating: Allows overlay to stay on top
+            // Modal: Prevents activation of windows below
+            // NOTE: Removed Sticky tag - we want overlay bound to specific Space (display)
+            // not appearing on all Spaces. Each display has its own overlay.
+            let mut tags: u64 = SLSWindowTags::Floating as u64
+                | SLSWindowTags::Modal as u64
+                | (1 << 9);
 
             let mut wid: WindowId = 0;
             cg_ok(SLSNewWindowWithOpaqueShapeAndContext(
@@ -237,6 +244,19 @@ impl CgsWindow {
                 self.connection,
                 self.id,
                 1, // kCGSOrderAbove
+                rel,
+            ))
+        }
+        .map_err(CgsWindowError::Level)
+    }
+
+    pub fn order_below(&self, relative: Option<WindowId>) -> Result<(), CgsWindowError> {
+        let rel = relative.unwrap_or(0);
+        unsafe {
+            cg_ok(SLSOrderWindow(
+                self.connection,
+                self.id,
+                -1, // kCGSOrderBelow
                 rel,
             ))
         }

@@ -117,6 +117,10 @@ impl LayoutEngine {
         self.offscreen_windows.contains_key(&wid)
     }
 
+    pub fn offscreen_display_for_window(&self, wid: WindowId) -> Option<usize> {
+        self.offscreen_windows.get(&wid).copied()
+    }
+
     /// Clear offscreen status for windows in a specific workspace on a display
     /// This should be called when switching TO a workspace, before refocusing
     pub fn clear_offscreen_for_workspace(&mut self, display: usize, workspace_id: VirtualWorkspaceId) {
@@ -1130,8 +1134,10 @@ impl LayoutEngine {
         F: Fn(WindowId) -> CGSize,
     {
         let mut positions = HashMap::default();
+        let mut current_display: Option<usize> = None;
 
         if let Some(display) = self.virtual_workspace_manager.get_display_for_space(space) {
+            current_display = Some(display);
             println!("[LAYOUT] Display {}: space {:?}", display, space);
             if let Some(active_workspace_id) = self.virtual_workspace_manager.active_workspace(display) {
                 println!("[LAYOUT] Display {}: active_workspace={:?}", display, active_workspace_id);
@@ -1146,6 +1152,16 @@ impl LayoutEngine {
                         stack_line_vert,
                     );
                     for (wid, rect) in tiled_positions {
+                        // CRITICAL: Skip windows that are offscreen - they must NOT be repositioned
+                        if self.offscreen_windows.contains_key(&wid) {
+                            println!("[LAYOUT] Display {}: SKIP window {:?} - currently offscreen, preserving offscreen position", display, wid);
+                            // Keep the existing offscreen position
+                            if let Some(&offscreen_rect) = self.positioned_windows_this_cycle.get(&wid) {
+                                positions.insert(wid, offscreen_rect);
+                            }
+                            continue;
+                        }
+
                         // Check which display this window actually belongs to
                         let window_workspace_d0 = self.virtual_workspace_manager.workspace_for_window(0, wid);
                         let window_workspace_d1 = self.virtual_workspace_manager.workspace_for_window(1, wid);
@@ -1178,6 +1194,16 @@ impl LayoutEngine {
                     .get_workspace_floating_positions(display, active_workspace_id);
                 for (window_id, stored_position) in floating_positions {
                     if self.floating.is_floating(window_id) {
+                        // CRITICAL: Skip windows that are offscreen - they must NOT be repositioned
+                        if self.offscreen_windows.contains_key(&window_id) {
+                            println!("[LAYOUT] Display {}: SKIP floating window {:?} - currently offscreen, preserving offscreen position", display, window_id);
+                            // Keep the existing offscreen position
+                            if let Some(&offscreen_rect) = self.positioned_windows_this_cycle.get(&window_id) {
+                                positions.insert(window_id, offscreen_rect);
+                            }
+                            continue;
+                        }
+
                         // Only position this window if it actually belongs to THIS display
                         let window_belongs_to_this_display = self.virtual_workspace_manager
                             .workspace_for_window(display, window_id)
@@ -1203,33 +1229,45 @@ impl LayoutEngine {
             let inactive_windows_on_this_display = self.virtual_workspace_manager
                 .windows_in_inactive_workspaces(display);
 
-            println!("[OFFSCREEN] Display {}: screen={:?}, inactive_windows={:?}", display, screen, inactive_windows_on_this_display);
+            let active_workspace = self.virtual_workspace_manager.active_workspace(display);
+            println!("[OFFSCREEN] Display {}: active_workspace={:?}, screen={:?}", display, active_workspace, screen);
+            println!("[OFFSCREEN] Display {}: inactive_windows count={}, list={:?}", display, inactive_windows_on_this_display.len(), inactive_windows_on_this_display);
 
-            // Position inactive windows just below this display's bottom edge
-            // This keeps them associated with the correct display/space while hiding them
+            // Log ALL windows we know about for this display
+            for (workspace_id, workspace_name) in self.virtual_workspace_manager.list_workspaces(display) {
+                let windows_in_ws: Vec<_> = self.virtual_workspace_manager
+                    .windows_in_workspace(display, workspace_id)
+                    .collect();
+                println!("[OFFSCREEN] Display {}: workspace {:?} ('{}') has {} windows: {:?}",
+                         display, workspace_id, workspace_name, windows_in_ws.len(), windows_in_ws);
+            }
+
+            // Clear all existing offscreen entries for this display first
+            // This ensures windows that moved to the active workspace are no longer marked as offscreen
+            self.offscreen_windows.retain(|_wid, &mut wid_display| wid_display != display);
+
+            // Mark inactive windows as offscreen - they will be EXCLUDED from all layouts
+            // and LEFT at their current position (no positioning commands sent)
             for &wid in &inactive_windows_on_this_display {
                 if self.virtual_workspace_manager.workspace_for_window(display, wid).is_some() {
-                    // Position far below the bottom of this screen
-                    // Use the screen's X coordinate to keep it "on" this display
-                    let offscreen_y = screen.origin.y + screen.size.height + 10000.0;
-                    let offscreen_rect = CGRect::new(
-                        objc2_core_foundation::CGPoint::new(
-                            screen.origin.x,  // Use display's X to keep it associated with this space
-                            offscreen_y,  // Far below bottom edge
-                        ),
-                        CGSize::new(100.0, 100.0),
-                    );
-                    println!("[OFFSCREEN] Display {}: screen.origin.y={}, screen.size.height={}, offscreen_y={}",
-                             display, screen.origin.y, screen.size.height, offscreen_y);
-                    println!("[OFFSCREEN] Display {}: Moving window {:?} to offscreen position {:?}", display, wid, offscreen_rect);
-                    positions.insert(wid, offscreen_rect);
-                    self.positioned_windows_this_cycle.insert(wid, offscreen_rect);
+                    println!("[OFFSCREEN] Display {}: Marking window {:?} as offscreen (excluded from layout)", display, wid);
                     self.offscreen_windows.insert(wid, display);
                 }
             }
         }
 
-        positions.into_iter().collect()
+        let final_positions: Vec<_> = positions.into_iter().collect();
+        if let Some(display) = current_display {
+            println!("[LAYOUT] Display {}: Final layout has {} windows", display, final_positions.len());
+            for (wid, rect) in &final_positions {
+                if rect.origin.y < 0.0 {
+                    println!("[LAYOUT] Display {}: window {:?} -> OFFSCREEN at y={}", display, wid, rect.origin.y);
+                } else {
+                    println!("[LAYOUT] Display {}: window {:?} -> ONSCREEN at {:?}", display, wid, rect);
+                }
+            }
+        }
+        final_positions
     }
 
     pub fn collect_group_containers_in_selection_path(
@@ -1277,6 +1315,10 @@ impl LayoutEngine {
                 stack_line_vert,
             );
             for (wid, rect) in tiled_positions {
+                // CRITICAL: Skip windows that are offscreen - they must NOT be repositioned
+                if self.offscreen_windows.contains_key(&wid) {
+                    continue;
+                }
                 positions.insert(wid, rect);
             }
         }
@@ -1287,6 +1329,10 @@ impl LayoutEngine {
                 .get_workspace_floating_positions(display, workspace_id);
             for (window_id, stored_position) in floating_positions {
                 if self.floating.is_floating(window_id) {
+                    // CRITICAL: Skip windows that are offscreen - they must NOT be repositioned
+                    if self.offscreen_windows.contains_key(&window_id) {
+                        continue;
+                    }
                     positions.insert(window_id, stored_position);
                 }
             }

@@ -328,6 +328,7 @@ pub struct Reactor {
     mission_control_manager: managers::MissionControlManager,
     refocus_manager: managers::RefocusManager,
     pending_space_change_manager: managers::PendingSpaceChangeManager,
+    workspace_overlay_manager: crate::ui::workspace_overlay::WorkspaceOverlayManager,
 }
 
 #[derive(Debug)]
@@ -524,6 +525,7 @@ impl Reactor {
             pending_space_change_manager: managers::PendingSpaceChangeManager {
                 pending_space_change: None,
             },
+            workspace_overlay_manager: crate::ui::workspace_overlay::WorkspaceOverlayManager::new(),
         }
     }
 
@@ -1664,6 +1666,11 @@ impl Reactor {
                     if in_changing_screens || (!in_visible_windows && !in_raise_windows) {
                         println!("[HANDLE_LAYOUT_RESPONSE] Clearing focus_window - changing_screens or (not visible and not in raise_windows)");
                         focus_window = None;
+                    } else if matches!(self.workspace_switch_manager.workspace_switch_state, WorkspaceSwitchState::Active) {
+                        // During workspace switches, skip the best_space_for_window check
+                        // The window might still be at its offscreen position, so checking its frame
+                        // would give the wrong space. We trust the layout engine's focus decision.
+                        println!("[HANDLE_LAYOUT_RESPONSE] Workspace switch active, trusting focus window {:?} without space validation", wid);
                     } else if let Some(space) = self.best_space_for_window(&state.frame_monotonic) {
                         let valid_spaces: Vec<_> = self.space_manager.screens.iter()
                             .flat_map(|s| s.space)

@@ -245,8 +245,174 @@ impl LayoutManager {
             }
         }
 
-        // Windows in inactive workspaces are positioned offscreen by the layout engine
-        // No need for explicit hide/show operations
+        // Update workspace overlays based on offscreen window state
+        // Window raise tracking in the manager prevents redundant operations and infinite loops
+        for (display_id, screen) in reactor.space_manager.screens.iter().enumerate() {
+            let active_workspace = reactor.layout_manager.layout_engine.active_workspace(display_id);
+
+            // Count offscreen windows on this display
+            let offscreen_count = reactor
+                .layout_manager
+                .layout_engine
+                .windows_to_hide()
+                .filter(|wid| {
+                    reactor.layout_manager.layout_engine.offscreen_display_for_window(*wid) == Some(display_id)
+                })
+                .count();
+
+            // Get visible (non-offscreen) windows in the active workspace
+            let visible_windows: Vec<_> = if let Some(active_ws) = active_workspace {
+                reactor
+                    .layout_manager
+                    .layout_engine
+                    .virtual_workspace_manager()
+                    .windows_in_workspace(display_id, active_ws)
+                    .filter(|wid| !reactor.layout_manager.layout_engine.is_window_offscreen(*wid))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // Show overlay whenever there are offscreen windows (to hide them)
+            let should_show_overlay = offscreen_count > 0;
+
+            println!("[WORKSPACE_OVERLAY] Display {}: active_ws={:?}, offscreen={}, visible={}, show_overlay={}",
+                     display_id, active_workspace, offscreen_count, visible_windows.len(), should_show_overlay);
+
+            if should_show_overlay {
+                // First, send offscreen windows to the back
+                let offscreen_windows: Vec<_> = reactor
+                    .layout_manager
+                    .layout_engine
+                    .windows_to_hide()
+                    .filter(|wid| {
+                        reactor.layout_manager.layout_engine.offscreen_display_for_window(*wid) == Some(display_id)
+                    })
+                    .collect();
+
+                // Order offscreen windows below the overlay (will be done after overlay is shown)
+
+                // Show overlay (state tracking prevents redundant operations)
+                match reactor.workspace_overlay_manager.show_overlay(display_id, screen.frame) {
+                    Ok(overlay_state_changed) => {
+                        // Raise windows if: overlay just appeared OR window set changed
+                        let window_set_changed = reactor.workspace_overlay_manager.should_raise_windows(display_id, visible_windows.clone());
+                        let needs_raise = overlay_state_changed || window_set_changed;
+
+                        println!("[WORKSPACE_OVERLAY] Display {}: overlay_changed={}, windows_changed={}, needs_raise={}, visible_count={}",
+                                 display_id, overlay_state_changed, window_set_changed, needs_raise, visible_windows.len());
+
+                        println!("[WORKSPACE_OVERLAY] About to check raise condition: needs_raise={}, empty={}", needs_raise, visible_windows.is_empty());
+
+                        if needs_raise && !visible_windows.is_empty() {
+                            println!("[WORKSPACE_OVERLAY] Raising {} visible windows above overlay (overlay_changed={}, windows_changed={})",
+                                     visible_windows.len(), overlay_state_changed, window_set_changed);
+
+                            // Group windows by PID since each app thread handles its own windows
+                            let mut windows_by_app: crate::common::collections::HashMap<crate::sys::app::pid_t, Vec<WindowId>> =
+                                crate::common::collections::HashMap::default();
+
+                            for wid in &visible_windows {
+                                windows_by_app.entry(wid.pid).or_default().push(*wid);
+                            }
+
+                            println!("[WORKSPACE_OVERLAY] Grouped into {} apps", windows_by_app.len());
+
+                            // Collect app handles and group windows for raising
+                            let mut app_handles = crate::common::collections::HashMap::default();
+                            let mut raise_windows_groups = Vec::new();
+
+                            for (pid, windows) in windows_by_app {
+                                if let Some(app) = reactor.app_manager.apps.get(&pid) {
+                                    app_handles.insert(pid, app.handle.clone());
+                                    raise_windows_groups.push(windows);
+                                } else {
+                                    println!("[WORKSPACE_OVERLAY] WARNING: No app handle found for pid {}", pid);
+                                }
+                            }
+
+                            println!("[WORKSPACE_OVERLAY] Collected {} app handles", app_handles.len());
+
+                            // Send raise request with properly grouped windows
+                            if !app_handles.is_empty() {
+                                println!("[WORKSPACE_OVERLAY] Sending raise request for {} window groups", raise_windows_groups.len());
+                                _ = reactor
+                                    .communication_manager
+                                    .raise_manager_tx
+                                    .send(crate::actor::raise_manager::Event::RaiseRequest(
+                                        crate::actor::reactor::RaiseRequest {
+                                            raise_windows: raise_windows_groups,
+                                            focus_window: None,
+                                            app_handles,
+                                        }
+                                    ));
+                            } else {
+                                println!("[WORKSPACE_OVERLAY] ERROR: No app handles available, cannot raise windows");
+                            }
+                        } else {
+                            println!("[WORKSPACE_OVERLAY] NOT raising windows: needs_raise={}, is_empty={}", needs_raise, visible_windows.is_empty());
+                        }
+
+                        // ALWAYS maintain z-order
+                        // This ensures the order is preserved even if other operations re-order windows
+
+                        if visible_windows.is_empty() {
+                            // No visible windows - overlay should be on top to hide all offscreen windows
+                            if !offscreen_windows.is_empty() {
+                                println!("[WORKSPACE_OVERLAY] Empty workspace: ordering overlay above {} offscreen windows", offscreen_windows.len());
+                                // Order overlay above all offscreen windows
+                                for offscreen_wid in &offscreen_windows {
+                                    if let Some(window_state) = reactor.window_manager.windows.get(offscreen_wid) {
+                                        if let Some(ws_id) = window_state.window_server_id {
+                                            if let Err(e) = reactor.workspace_overlay_manager.order_overlay_above(display_id, ws_id.into()) {
+                                                println!("[WORKSPACE_OVERLAY] Failed to order overlay above offscreen window {:?}: {:?}", ws_id, e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // Have visible windows - maintain z-order: offscreen < overlay < visible
+
+                            // First, order overlay above all offscreen windows to hide them
+                            if !offscreen_windows.is_empty() {
+                                for offscreen_wid in &offscreen_windows {
+                                    if let Some(window_state) = reactor.window_manager.windows.get(offscreen_wid) {
+                                        if let Some(ws_id) = window_state.window_server_id {
+                                            if let Err(e) = reactor.workspace_overlay_manager.order_overlay_above(display_id, ws_id.into()) {
+                                                println!("[WORKSPACE_OVERLAY] Failed to order overlay above offscreen window {:?}: {:?}", ws_id, e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Then, order overlay below ALL visible windows
+                            // This ensures every visible window (including Chrome) is above the overlay
+                            for visible_wid in &visible_windows {
+                                if let Some(window_state) = reactor.window_manager.windows.get(visible_wid) {
+                                    if let Some(ws_id) = window_state.window_server_id {
+                                        if let Err(e) = reactor.workspace_overlay_manager.order_overlay_behind(display_id, ws_id.into()) {
+                                            println!("[WORKSPACE_OVERLAY] Failed to order overlay below visible window {:?}: {:?}", ws_id, e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("[WORKSPACE_OVERLAY] Failed to show overlay for display {}: {:?}", display_id, e);
+                    }
+                }
+            } else {
+                // No offscreen windows, hide the overlay and clear raised window tracking
+                if let Err(e) = reactor.workspace_overlay_manager.hide_overlay(display_id) {
+                    println!("[WORKSPACE_OVERLAY] Failed to hide overlay for display {}: {:?}", display_id, e);
+                }
+                // Clear the raised windows tracking when hiding overlay
+                reactor.workspace_overlay_manager.should_raise_windows(display_id, Vec::new());
+            }
+        }
 
         reactor.maybe_send_menu_update();
         Ok(any_frame_changed)

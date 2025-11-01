@@ -272,15 +272,8 @@ impl WindowEventHandler {
                 let old_space = reactor.best_space_for_window(&old_frame);
                 let new_space = reactor.best_space_for_window(&new_frame);
 
-                // Check if this window is intentionally positioned offscreen for virtual workspace hiding
-                let is_offscreen = reactor.layout_manager.layout_engine.is_window_offscreen(wid);
-
                 if old_space != new_space {
-                    if is_offscreen {
-                        // Skip reassignment logic for windows we've intentionally positioned offscreen
-                        // This prevents them from being reassigned to the wrong display/workspace
-                        println!("[FRAME_CHANGED] Window {:?} is offscreen, skipping space change handling", wid);
-                    } else if matches!(
+                    if matches!(
                         reactor.drag_manager.drag_state,
                         DragState::Active { .. } | DragState::PendingSwap { .. }
                     ) || matches!(&reactor.drag_manager.drag_state, DragState::Active { session } if session.window == wid)
