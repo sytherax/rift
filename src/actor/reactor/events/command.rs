@@ -81,6 +81,8 @@ impl CommandEventHandler {
             reactor.update_app_visibility_global();
         }
 
+        println!("[COMMAND] About to handle_layout_response with focus_window={:?}, raise_windows={:?}",
+               response.focus_window, response.raise_windows);
         reactor.handle_layout_response(response);
     }
 

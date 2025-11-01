@@ -842,12 +842,16 @@ impl Reactor {
         }
 
         // Execute deferred mouse warp after workspace switch completes
+        println!("[MOUSE WARP] Checking pending_workspace_mouse_warp: {:?}",
+                 self.workspace_switch_manager.pending_workspace_mouse_warp);
         if let Some(wid) = self.workspace_switch_manager.pending_workspace_mouse_warp.take() {
-            tracing::debug!("Executing deferred mouse warp for window {:?}", wid);
+            println!("[MOUSE WARP] Executing deferred mouse warp for window {:?}", wid);
 
-            if let Some(_window) = self.window_manager.windows.get(&wid) {
+            if let Some(window) = self.window_manager.windows.get(&wid) {
                 // Find which display has this window in its active workspace
                 let mut target_display = None;
+                println!("[MOUSE WARP] Checking {} displays/screens", self.space_manager.screens.len());
+
                 for (display_idx, screen) in self.space_manager.screens.iter().enumerate() {
                     if let Some(space) = screen.space {
                         if let Some(display_id) = self.layout_manager.layout_engine
@@ -858,36 +862,38 @@ impl Reactor {
                             let active_windows = self.layout_manager.layout_engine
                                 .windows_in_active_workspace(display_id);
 
-                            tracing::trace!("Checking display {} (screen {}): active_workspace has {} windows",
-                                          display_id, display_idx, active_windows.len());
+                            println!("[MOUSE WARP] Display {} (screen {}): space={:?}, active_workspace has {} windows",
+                                   display_id, display_idx, space, active_windows.len());
 
                             if active_windows.contains(&wid) {
                                 target_display = Some((display_idx, screen.frame));
-                                tracing::debug!("Found window {:?} in active workspace on display {} (screen {})",
-                                              wid, display_id, display_idx);
+                                println!("[MOUSE WARP] ✓ Found window {:?} in active workspace on display {} (screen {})",
+                                       wid, display_id, display_idx);
                                 break;
                             }
                         }
                     }
                 }
 
-                if let Some((display_idx, screen_frame)) = target_display {
-                    // For cross-display switches, always warp to screen center first since
-                    // the window frame may not have been updated to its new position yet
-                    let warp_point = screen_frame.mid();
+                if let Some((display_idx, _screen_frame)) = target_display {
+                    // Warp to the actual window position
+                    let warp_point = window.frame_monotonic.mid();
 
-                    tracing::debug!("Warping mouse to display {} center at {:?} for window {:?}",
-                                  display_idx, warp_point, wid);
+                    println!("[MOUSE WARP] Warping mouse to window {:?} at {:?} on display {}",
+                           wid, warp_point, display_idx);
 
                     if let Err(e) = crate::sys::event::warp_mouse(warp_point) {
+                        println!("[MOUSE WARP] ✗ Failed to execute deferred mouse warp: {e:?}");
                         warn!("Failed to execute deferred mouse warp: {e:?}");
                     } else {
-                        tracing::debug!("Mouse warped to display {} for window {:?}", display_idx, wid);
+                        println!("[MOUSE WARP] ✓ Mouse warped to window {:?} at {:?} on display {}", wid, warp_point, display_idx);
                     }
                 } else {
+                    println!("[MOUSE WARP] ✗ Could not find target display - window {:?} not in any active workspace", wid);
                     tracing::warn!("Could not find target display for mouse warp - window {:?} not in any active workspace", wid);
                 }
             } else {
+                println!("[MOUSE WARP] ✗ Window {:?} not found for deferred mouse warp", wid);
                 tracing::warn!("Window {:?} not found for deferred mouse warp", wid);
             }
         }
@@ -1583,7 +1589,11 @@ impl Reactor {
     }
 
     fn handle_layout_response(&mut self, response: layout::EventResponse) {
+        println!("[HANDLE_LAYOUT_RESPONSE] Called with focus_window={:?}, raise_windows.len()={}",
+               response.focus_window, response.raise_windows.len());
+
         if self.is_in_drag() {
+            println!("[HANDLE_LAYOUT_RESPONSE] In drag, returning early");
             self.workspace_switch_manager.workspace_switch_state = WorkspaceSwitchState::Inactive;
             return;
         }
@@ -1598,6 +1608,9 @@ impl Reactor {
             mut focus_window,
         } = response;
         let original_focus = focus_window;
+
+        println!("[HANDLE_LAYOUT_RESPONSE] After destructuring: focus_window={:?}, original_focus={:?}",
+               focus_window, original_focus);
 
         let mut handled_without_raise = false;
 
@@ -1634,16 +1647,23 @@ impl Reactor {
                     if self.space_manager.changing_screens.contains(&wsid)
                         || !self.window_manager.visible_windows.contains(&wsid)
                     {
+                        println!("[HANDLE_LAYOUT_RESPONSE] Clearing focus_window - changing_screens or not visible");
                         focus_window = None;
                     } else if let Some(space) = self.best_space_for_window(&state.frame_monotonic) {
-                        if let Some(active_space) =
-                            self.space_manager.screens.iter().flat_map(|s| s.space).next()
-                        {
-                            if space != active_space {
-                                focus_window = None;
-                            }
+                        // In multi-display mode with separate spaces, check if window is on ANY valid space
+                        let is_on_valid_space = self.space_manager.screens.iter()
+                            .flat_map(|s| s.space)
+                            .any(|s| s == space);
+
+                        println!("[HANDLE_LAYOUT_RESPONSE] Window {:?} on space {:?}, is_on_valid_space={}",
+                               wid, space, is_on_valid_space);
+
+                        if !is_on_valid_space {
+                            println!("[HANDLE_LAYOUT_RESPONSE] Clearing focus_window - not on any valid space");
+                            focus_window = None;
                         }
                     } else {
+                        println!("[HANDLE_LAYOUT_RESPONSE] Clearing focus_window - no best_space_for_window");
                         focus_window = None;
                     }
                 }
@@ -1662,6 +1682,9 @@ impl Reactor {
             }
         }
 
+        println!("[HANDLE_LAYOUT_RESPONSE] Before early return check: raise_windows.is_empty()={}, focus_window.is_none()={}, workspace_switch_state={:?}",
+               raise_windows.is_empty(), focus_window.is_none(), self.workspace_switch_manager.workspace_switch_state);
+
         if raise_windows.is_empty()
             && focus_window.is_none()
             && matches!(
@@ -1669,9 +1692,11 @@ impl Reactor {
                 WorkspaceSwitchState::Inactive
             )
         {
+            println!("[HANDLE_LAYOUT_RESPONSE] Early return triggered - nothing to do");
             return;
         }
 
+        println!("[HANDLE_LAYOUT_RESPONSE] Passed early return, building app_handles");
         let mut app_handles = HashMap::default();
         for &wid in raise_windows.iter() {
             if let Some(app) = self.app_manager.apps.get(&wid.pid) {
@@ -1697,12 +1722,16 @@ impl Reactor {
         }
 
         let focus_window_with_warp = focus_window.map(|wid| {
+            println!("[MOUSE WARP] focus_window={:?}, mouse_follows_focus={}, workspace_switch_state={:?}",
+                   wid, self.config_manager.config.settings.mouse_follows_focus,
+                   self.workspace_switch_manager.workspace_switch_state);
             let warp = match self.config_manager.config.settings.mouse_follows_focus {
                 true => {
                     if self.workspace_switch_manager.workspace_switch_state
                         == WorkspaceSwitchState::Active
                     {
                         // During workspace switches, defer mouse warping until after layout completes
+                        println!("[MOUSE WARP] Setting pending_workspace_mouse_warp = {:?}", wid);
                         tracing::debug!("Deferring mouse warp for window {:?} until after workspace switch completes", wid);
                         self.workspace_switch_manager.pending_workspace_mouse_warp = Some(wid);
                         None

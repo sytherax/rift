@@ -129,12 +129,14 @@ impl LayoutEngine {
         };
 
         let display_debug = format!("{}", display);
+        println!("[REFOCUS] refocus_workspace: space={:?}, workspace_id={:?}, display_id={}", space, workspace_id, display_debug);
         tracing::debug!("refocus_workspace: space={:?}, workspace_id={:?}, display_id={}", space, workspace_id, display_debug);
 
         let mut focus_window =
             self.virtual_workspace_manager.last_focused_window(display, workspace_id);
 
-        tracing::debug!("Last focused window for workspace {:?} on display_id {:?}: {:?}", workspace_id, display, focus_window);
+        println!("[REFOCUS] Last focused window for workspace {:?} on display_id {}: {:?}", workspace_id, display_debug, focus_window);
+        tracing::debug!("Last focused window for workspace {:?} on display_id {}: {:?}", workspace_id, display_debug, focus_window);
 
         if focus_window.is_none() {
             if let Some(layout) = self.workspace_layouts.active(space, workspace_id) {
@@ -166,8 +168,10 @@ impl LayoutEngine {
                 .set_last_focused_window(display, workspace_id, None);
         }
 
-        tracing::debug!("refocus_workspace returning focus_window={:?} for workspace {:?} on display_id {:?}",
-                      focus_window, workspace_id, display);
+        println!("[REFOCUS] refocus_workspace returning focus_window={:?} for workspace {:?} on display_id {}",
+               focus_window, workspace_id, display_debug);
+        tracing::debug!("refocus_workspace returning focus_window={:?} for workspace {:?} on display_id {}",
+                      focus_window, workspace_id, display_debug);
 
         EventResponse {
             focus_window,
@@ -1179,8 +1183,12 @@ impl LayoutEngine {
                 if let Some((target_display, workspace_id)) =
                     self.virtual_workspace_manager_mut().workspace_by_global_index(*workspace_index)
                 {
-                    tracing::debug!("SwitchToWorkspace({}): target_display_id={:?}, workspace_id={:?}, current_display_id={:?}, current_space={:?}",
-                                  workspace_index, target_display, workspace_id, display, space);
+                    let target_display_debug = format!("{}", target_display);
+                    let current_display_debug = format!("{}", display);
+                    println!("[WORKSPACE SWITCH] SwitchToWorkspace({}): target_display_id={}, workspace_id={:?}, current_display_id={}, current_space={:?}",
+                           workspace_index, target_display_debug, workspace_id, current_display_debug, space);
+                    tracing::debug!("SwitchToWorkspace({}): target_display_id={}, workspace_id={:?}, current_display_id={}, current_space={:?}",
+                                  workspace_index, target_display_debug, workspace_id, current_display_debug, space);
 
                     // Check if we're already on this workspace
                     if display == target_display &&
@@ -1205,13 +1213,17 @@ impl LayoutEngine {
 
                     // If the workspace is on a different display, we need to get the space for that display
                     let target_space = if target_display == display {
-                        tracing::debug!("Workspace {} is on current display_id {:?}, using current space {:?}",
-                                      workspace_index, display, space);
+                        println!("[WORKSPACE SWITCH] Workspace {} is on current display_id {}, using current space {:?}",
+                               workspace_index, current_display_debug, space);
+                        tracing::debug!("Workspace {} is on current display_id {}, using current space {:?}",
+                                      workspace_index, current_display_debug, space);
                         space
                     } else {
                         // Get the space for the target display
                         match self.virtual_workspace_manager.get_space_for_display(target_display) {
                             Some(s) => {
+                                println!("[WORKSPACE SWITCH] Workspace {} is on different display_id {}, got target space {:?}",
+                                       workspace_index, target_display, s);
                                 tracing::debug!("Workspace {} is on different display_id {}, got target space {:?}",
                                               workspace_index, target_display, s);
                                 s
