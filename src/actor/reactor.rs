@@ -474,6 +474,7 @@ impl Reactor {
                 active_workspace_switch: None,
                 last_auto_workspace_switch: None,
                 pending_workspace_mouse_warp: None,
+                visible_apps_per_display: HashMap::default(),
             },
             recording_manager: managers::RecordingManager { record },
             communication_manager: managers::CommunicationManager {
@@ -2096,5 +2097,65 @@ impl Reactor {
         } else {
             Err(format!("Failed to unhide app with pid {}", pid))
         }
+    }
+
+    /// Update app visibility for a display based on active workspace
+    /// Hides apps that have no windows in the active workspace
+    /// Unhides apps that have windows in the active workspace
+    fn update_app_visibility_for_display(&mut self, display: usize) {
+        let display_id = display; // Avoid variable name conflict with tracing::field::display
+
+        // Get active workspace for this display
+        let Some(active_workspace_id) = self.layout_manager.layout_engine.active_workspace(display) else {
+            return;
+        };
+
+        // Get all windows in the active workspace
+        let active_windows = self.layout_manager
+            .layout_engine
+            .windows_in_active_workspace(display);
+
+        // Get all windows in inactive workspaces
+        let inactive_windows = self.layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .windows_in_inactive_workspaces(display);
+
+        // Group active windows by PID
+        let mut active_pids = HashSet::default();
+        for wid in &active_windows {
+            active_pids.insert(wid.pid);
+        }
+
+        // Group inactive windows by PID
+        let mut inactive_pids = HashSet::default();
+        for wid in &inactive_windows {
+            inactive_pids.insert(wid.pid);
+        }
+
+        // Apps to unhide: have windows in active workspace
+        for &pid in &active_pids {
+            if crate::sys::app::is_app_hidden(pid) {
+                tracing::debug!("Unhiding app {} (has windows in active workspace on display {})", pid, display_id);
+                if let Err(e) = self.unhide_app(pid) {
+                    tracing::warn!("Failed to unhide app {}: {}", pid, e);
+                }
+            }
+        }
+
+        // Apps to hide: ONLY have windows in inactive workspaces (and none in active)
+        for &pid in &inactive_pids {
+            if !active_pids.contains(&pid) && !crate::sys::app::is_app_hidden(pid) {
+                tracing::debug!("Hiding app {} (no windows in active workspace on display {})", pid, display_id);
+                if let Err(e) = self.hide_app(pid) {
+                    tracing::warn!("Failed to hide app {}: {}", pid, e);
+                }
+            }
+        }
+
+        // Update tracking
+        self.workspace_switch_manager
+            .visible_apps_per_display
+            .insert(display, active_pids);
     }
 }

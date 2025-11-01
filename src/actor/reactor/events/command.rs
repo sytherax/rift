@@ -69,6 +69,15 @@ impl CommandEventHandler {
             WorkspaceSwitchState::Inactive
         };
         reactor.handle_layout_response(response);
+
+        // Update app visibility after workspace switch
+        if is_workspace_switch {
+            if let Some(space) = reactor.workspace_command_space() {
+                if let Some(display) = reactor.display_for_space(space) {
+                    reactor.update_app_visibility_for_display(display);
+                }
+            }
+        }
     }
 
     pub fn handle_command_metrics(_reactor: &mut Reactor, cmd: MetricsCommand) {

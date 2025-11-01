@@ -88,6 +88,8 @@ pub struct WorkspaceSwitchManager {
     pub active_workspace_switch: Option<u64>,
     pub last_auto_workspace_switch: Option<AutoWorkspaceSwitch>,
     pub pending_workspace_mouse_warp: Option<WindowId>,
+    /// Track which apps are currently visible per display (for app hiding)
+    pub visible_apps_per_display: crate::common::collections::HashMap<usize, crate::common::collections::HashSet<crate::sys::app::pid_t>>,
 }
 
 /// Manages refocus and cleanup state
