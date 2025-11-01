@@ -413,6 +413,20 @@ impl Reactor {
             .spawn(move || {
                 let mut reactor =
                     Reactor::new(config, layout_engine, record, broadcast_tx, window_notify);
+
+                // Log multi-monitor configuration
+                let separate_spaces = crate::sys::screen::displays_have_separate_spaces();
+                tracing::info!(
+                    "Reactor initialized with {} display(s), separate spaces mode: {}",
+                    reactor.space_manager.screens.len(),
+                    separate_spaces
+                );
+                if separate_spaces {
+                    tracing::info!("Multi-monitor support: Each display has independent workspaces");
+                } else {
+                    tracing::warn!("Separate spaces mode disabled - this configuration is required for Rift");
+                }
+
                 reactor.communication_manager.event_tap_tx = Some(event_tap_tx);
                 reactor.menu_manager.menu_tx = Some(menu_tx);
                 reactor.communication_manager.stack_line_tx = Some(stack_line_tx);
@@ -981,6 +995,12 @@ impl Reactor {
             screen.space = space;
             // Update the VirtualWorkspaceManager's display_to_space mapping
             if let Some(space_id) = space {
+                tracing::debug!(
+                    "Mapping display {} to space {} (separate spaces mode: {})",
+                    display_idx,
+                    space_id.get(),
+                    crate::sys::screen::displays_have_separate_spaces()
+                );
                 self.layout_manager
                     .layout_engine
                     .virtual_workspace_manager_mut()
