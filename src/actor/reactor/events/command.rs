@@ -16,6 +16,8 @@ pub struct CommandEventHandler;
 impl CommandEventHandler {
     pub fn handle_command_layout(reactor: &mut Reactor, cmd: LayoutCommand) {
         info!(?cmd);
+        println!("[COMMAND] handle_command_layout: {:?}", cmd);
+
         let visible_spaces = reactor
             .space_manager
             .screens
@@ -35,6 +37,10 @@ impl CommandEventHandler {
             cmd,
             LayoutCommand::MoveWindowToWorkspace(_)
         );
+
+        if is_window_workspace_change {
+            println!("[COMMAND] MoveWindowToWorkspace detected");
+        }
 
         if is_workspace_switch {
             if let Some(space) = reactor.workspace_command_space() {

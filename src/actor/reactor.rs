@@ -1643,17 +1643,32 @@ impl Reactor {
 
         if let Some(wid) = focus_window {
             if let Some(state) = self.window_manager.windows.get(&wid) {
+                println!("[HANDLE_LAYOUT_RESPONSE] Checking focus_window {:?}: frame={:?}, wsid={:?}",
+                       wid, state.frame_monotonic, state.window_server_id);
+
                 if let Some(wsid) = state.window_server_id {
-                    if self.space_manager.changing_screens.contains(&wsid)
-                        || !self.window_manager.visible_windows.contains(&wsid)
-                    {
-                        println!("[HANDLE_LAYOUT_RESPONSE] Clearing focus_window - changing_screens or not visible");
+                    let in_changing_screens = self.space_manager.changing_screens.contains(&wsid);
+                    let in_visible_windows = self.window_manager.visible_windows.contains(&wsid);
+                    let in_raise_windows = raise_windows.contains(&wid);
+
+                    println!("[HANDLE_LAYOUT_RESPONSE] Window {:?}: changing_screens={}, visible_windows={}, in_raise_windows={}",
+                           wid, in_changing_screens, in_visible_windows, in_raise_windows);
+
+                    // Skip visible_windows check if the window is explicitly being raised by the layout engine
+                    // (e.g., after MoveWindowToWorkspace where Window Server info may be stale)
+                    if in_changing_screens || (!in_visible_windows && !in_raise_windows) {
+                        println!("[HANDLE_LAYOUT_RESPONSE] Clearing focus_window - changing_screens or (not visible and not in raise_windows)");
                         focus_window = None;
                     } else if let Some(space) = self.best_space_for_window(&state.frame_monotonic) {
-                        // In multi-display mode with separate spaces, check if window is on ANY valid space
-                        let is_on_valid_space = self.space_manager.screens.iter()
+                        let valid_spaces: Vec<_> = self.space_manager.screens.iter()
                             .flat_map(|s| s.space)
-                            .any(|s| s == space);
+                            .collect();
+
+                        println!("[HANDLE_LAYOUT_RESPONSE] best_space_for_window returned space {:?}, valid_spaces={:?}",
+                               space, valid_spaces);
+
+                        // In multi-display mode with separate spaces, check if window is on ANY valid space
+                        let is_on_valid_space = valid_spaces.contains(&space);
 
                         println!("[HANDLE_LAYOUT_RESPONSE] Window {:?} on space {:?}, is_on_valid_space={}",
                                wid, space, is_on_valid_space);
