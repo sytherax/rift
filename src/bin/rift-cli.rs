@@ -57,6 +57,8 @@ enum ServiceCommands {
 enum QueryCommands {
     /// List all virtual workspaces
     Workspaces,
+    /// List all displays with their current spaces
+    Displays,
     /// List windows (optionally filtered by space)
     Windows {
         #[arg(long)]
@@ -349,6 +351,7 @@ fn build_request(command: Commands) -> Result<RiftRequest, String> {
 fn build_query_request(query: QueryCommands) -> Result<RiftRequest, String> {
     match query {
         QueryCommands::Workspaces => Ok(RiftRequest::GetWorkspaces),
+        QueryCommands::Displays => Ok(RiftRequest::GetDisplays),
         QueryCommands::Windows { space_id } => Ok(RiftRequest::GetWindows { space_id }),
         QueryCommands::Window { window_id } => Ok(RiftRequest::GetWindowInfo { window_id }),
         QueryCommands::Applications => Ok(RiftRequest::GetApplications),

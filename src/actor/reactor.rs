@@ -66,7 +66,7 @@ type Receiver = actor::Receiver<Event>;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-use crate::model::server::{ApplicationData, LayoutStateData, WindowData, WorkspaceQueryResponse};
+use crate::model::server::{ApplicationData, DisplayData, LayoutStateData, WindowData, WorkspaceQueryResponse};
 
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug)]
@@ -188,6 +188,8 @@ pub enum Event {
     // Query events with response channels (not serialized)
     #[serde(skip)]
     QueryWorkspaces(r#continue::Sender<WorkspaceQueryResponse>),
+    #[serde(skip)]
+    QueryDisplays(r#continue::Sender<Vec<DisplayData>>),
     #[serde(skip)]
     QueryWindows {
         space_id: Option<SpaceId>,
@@ -623,6 +625,7 @@ impl Reactor {
                 | Event::QueryWindowInfo { .. }
                 | Event::QueryWindows { .. }
                 | Event::QueryWorkspaces(..)
+                | Event::QueryDisplays(..)
         ) {
             return self.handle_query(event);
         }
@@ -840,14 +843,52 @@ impl Reactor {
 
         // Execute deferred mouse warp after workspace switch completes
         if let Some(wid) = self.workspace_switch_manager.pending_workspace_mouse_warp.take() {
-            if let Some(window) = self.window_manager.windows.get(&wid) {
-                let window_center = window.frame_monotonic.mid();
-                // Only warp if the window is now positioned on-screen
-                if self.space_manager.screens.iter().any(|s| s.frame.contains(window_center)) {
-                    if let Err(e) = crate::sys::event::warp_mouse(window_center) {
-                        warn!("Failed to execute deferred mouse warp: {e:?}");
+            tracing::debug!("Executing deferred mouse warp for window {:?}", wid);
+
+            if let Some(_window) = self.window_manager.windows.get(&wid) {
+                // Find which display has this window in its active workspace
+                let mut target_display = None;
+                for (display_idx, screen) in self.space_manager.screens.iter().enumerate() {
+                    if let Some(space) = screen.space {
+                        if let Some(display_id) = self.layout_manager.layout_engine
+                            .virtual_workspace_manager()
+                            .get_display_for_space(space)
+                        {
+                            // Check if this window is in the active workspace on this display
+                            let active_windows = self.layout_manager.layout_engine
+                                .windows_in_active_workspace(display_id);
+
+                            tracing::trace!("Checking display {} (screen {}): active_workspace has {} windows",
+                                          display_id, display_idx, active_windows.len());
+
+                            if active_windows.contains(&wid) {
+                                target_display = Some((display_idx, screen.frame));
+                                tracing::debug!("Found window {:?} in active workspace on display {} (screen {})",
+                                              wid, display_id, display_idx);
+                                break;
+                            }
+                        }
                     }
                 }
+
+                if let Some((display_idx, screen_frame)) = target_display {
+                    // For cross-display switches, always warp to screen center first since
+                    // the window frame may not have been updated to its new position yet
+                    let warp_point = screen_frame.mid();
+
+                    tracing::debug!("Warping mouse to display {} center at {:?} for window {:?}",
+                                  display_idx, warp_point, wid);
+
+                    if let Err(e) = crate::sys::event::warp_mouse(warp_point) {
+                        warn!("Failed to execute deferred mouse warp: {e:?}");
+                    } else {
+                        tracing::debug!("Mouse warped to display {} for window {:?}", display_idx, wid);
+                    }
+                } else {
+                    tracing::warn!("Could not find target display for mouse warp - window {:?} not in any active workspace", wid);
+                }
+            } else {
+                tracing::warn!("Window {:?} not found for deferred mouse warp", wid);
             }
         }
 
@@ -1662,6 +1703,7 @@ impl Reactor {
                         == WorkspaceSwitchState::Active
                     {
                         // During workspace switches, defer mouse warping until after layout completes
+                        tracing::debug!("Deferring mouse warp for window {:?} until after workspace switch completes", wid);
                         self.workspace_switch_manager.pending_workspace_mouse_warp = Some(wid);
                         None
                     } else {
@@ -2057,125 +2099,158 @@ impl Reactor {
             .position(|screen| screen.space == Some(space))
     }
 
-    /// Get the SpaceId for a given DisplayId (screen index)
-    fn space_for_display(&self, display: usize) -> Option<SpaceId> {
-        self.space_manager.screens.get(display).and_then(|screen| screen.space)
-    }
-
-    /// Get the DisplayId for a window based on its frame/position
-    /// Finds which screen contains the center of the window
-    fn display_for_window_frame(&self, frame: &CGRect) -> Option<usize> {
-        let center = CGPoint::new(
-            frame.origin.x + frame.size.width / 2.0,
-            frame.origin.y + frame.size.height / 2.0
-        );
-
-        self.space_manager
-            .screens
-            .iter()
-            .enumerate()
-            .find(|(_, screen)| {
-                center.x >= screen.frame.origin.x
-                    && center.x < screen.frame.origin.x + screen.frame.size.width
-                    && center.y >= screen.frame.origin.y
-                    && center.y < screen.frame.origin.y + screen.frame.size.height
-            })
-            .map(|(idx, _)| idx)
-            .or_else(|| {
-                // Fallback: use first screen
-                if !self.space_manager.screens.is_empty() {
-                    Some(0)
-                } else {
-                    None
-                }
-            })
-    }
-
-    /// Get the DisplayId for a window
-    fn display_for_window(&self, window_id: WindowId) -> Option<usize> {
-        self.window_manager
-            .windows
-            .get(&window_id)
-            .and_then(|window_state| self.display_for_window_frame(&window_state.frame_monotonic))
-    }
-
-    /// Hide an application by its process ID
+    /// Hide an application by its process ID with retry logic
     fn hide_app(&self, pid: pid_t) -> Result<(), String> {
-        if crate::sys::app::hide_app(pid) {
-            tracing::debug!("Successfully hid app with pid {}", pid);
-            Ok(())
-        } else {
-            Err(format!("Failed to hide app with pid {}", pid))
-        }
-    }
+        const MAX_RETRIES: usize = 3;
+        const RETRY_DELAY_MS: u64 = 10;
 
-    /// Unhide an application by its process ID
-    fn unhide_app(&self, pid: pid_t) -> Result<(), String> {
-        if crate::sys::app::unhide_app(pid) {
-            tracing::debug!("Successfully unhid app with pid {}", pid);
-            Ok(())
-        } else {
-            Err(format!("Failed to unhide app with pid {}", pid))
-        }
-    }
+        for attempt in 0..MAX_RETRIES {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS * attempt as u64));
+            }
 
-    /// Update app visibility for a display based on active workspace
-    /// Hides apps that have no windows in the active workspace
-    /// Unhides apps that have windows in the active workspace
-    fn update_app_visibility_for_display(&mut self, display: usize) {
-        let display_id = display; // Avoid variable name conflict with tracing::field::display
+            if crate::sys::app::hide_app(pid) {
+                tracing::trace!("Successfully hid app {} on attempt {}", pid, attempt + 1);
+                return Ok(());
+            }
 
-        // Get active workspace for this display
-        let Some(_active_workspace_id) = self.layout_manager.layout_engine.active_workspace(display) else {
-            return;
-        };
-
-        // Get all windows in the active workspace
-        let active_windows = self.layout_manager
-            .layout_engine
-            .windows_in_active_workspace(display);
-
-        // Get all windows in inactive workspaces
-        let inactive_windows = self.layout_manager
-            .layout_engine
-            .virtual_workspace_manager()
-            .windows_in_inactive_workspaces(display);
-
-        // Group active windows by PID
-        let mut active_pids = HashSet::default();
-        for wid in &active_windows {
-            active_pids.insert(wid.pid);
-        }
-
-        // Group inactive windows by PID
-        let mut inactive_pids = HashSet::default();
-        for wid in &inactive_windows {
-            inactive_pids.insert(wid.pid);
-        }
-
-        // Apps to unhide: have windows in active workspace
-        // We always try to unhide, not just when the app reports as hidden,
-        // because the hidden state might not be accurate
-        for &pid in &active_pids {
-            tracing::debug!("Unhiding app {} (has windows in active workspace on display {})", pid, display_id);
-            if let Err(e) = self.unhide_app(pid) {
-                tracing::warn!("Failed to unhide app {}: {}", pid, e);
+            // Check if the app is already hidden (desired state achieved despite API failure)
+            if crate::sys::app::is_app_hidden(pid) {
+                tracing::trace!("App {} already hidden (attempt {})", pid, attempt + 1);
+                return Ok(());
             }
         }
 
-        // Apps to hide: ONLY have windows in inactive workspaces (and none in active)
-        for &pid in &inactive_pids {
-            if !active_pids.contains(&pid) && !crate::sys::app::is_app_hidden(pid) {
-                tracing::debug!("Hiding app {} (no windows in active workspace on display {})", pid, display_id);
+        // Only warn if all retries failed AND the app is still not hidden
+        if !crate::sys::app::is_app_hidden(pid) {
+            Err(format!("Failed to hide app {} after {} attempts", pid, MAX_RETRIES))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Unhide an application by its process ID with retry logic
+    fn unhide_app(&self, pid: pid_t) -> Result<(), String> {
+        const MAX_RETRIES: usize = 3;
+        const RETRY_DELAY_MS: u64 = 10;
+
+        for attempt in 0..MAX_RETRIES {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS * attempt as u64));
+            }
+
+            if crate::sys::app::unhide_app(pid) {
+                tracing::trace!("Successfully unhid app {} on attempt {}", pid, attempt + 1);
+                return Ok(());
+            }
+
+            // Check if the app is already visible (desired state achieved despite API failure)
+            if !crate::sys::app::is_app_hidden(pid) {
+                tracing::trace!("App {} already visible (attempt {})", pid, attempt + 1);
+                return Ok(());
+            }
+        }
+
+        // Only warn if all retries failed AND the app is still hidden
+        if crate::sys::app::is_app_hidden(pid) {
+            Err(format!("Failed to unhide app {} after {} attempts", pid, MAX_RETRIES))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Update app visibility globally across all displays
+    /// This ensures we make consistent hide/unhide decisions
+    pub(crate) fn update_app_visibility_global(&mut self) {
+        let num_displays = self.space_manager.screens.len();
+
+        // Collect all PIDs that should be visible (have windows in any active workspace)
+        let mut globally_visible_pids = HashSet::default();
+
+        // Collect all PIDs that have windows (for hiding candidates)
+        let mut all_pids = HashSet::default();
+
+        for display in 0..num_displays {
+            if self.layout_manager.layout_engine.active_workspace(display).is_none() {
+                continue;
+            }
+
+            let active_windows = self.layout_manager
+                .layout_engine
+                .windows_in_active_workspace(display);
+
+            let inactive_windows = self.layout_manager
+                .layout_engine
+                .virtual_workspace_manager()
+                .windows_in_inactive_workspaces(display);
+
+            // Track all active windows globally
+            for wid in &active_windows {
+                globally_visible_pids.insert(wid.pid);
+                all_pids.insert(wid.pid);
+            }
+
+            // Track all inactive windows for hiding candidates
+            for wid in &inactive_windows {
+                all_pids.insert(wid.pid);
+            }
+        }
+
+        // Now make global hide/unhide decisions
+
+        // Unhide all apps that should be visible
+        // Check current state first to avoid unnecessary operations
+        for &pid in &globally_visible_pids {
+            let is_hidden = crate::sys::app::is_app_hidden(pid);
+            if is_hidden {
+                tracing::trace!("Unhiding app {} (has windows in active workspace globally)", pid);
+                if let Err(e) = self.unhide_app(pid) {
+                    tracing::warn!("Failed to unhide app {}: {}", pid, e);
+                }
+            } else {
+                tracing::trace!("App {} already visible, skipping unhide", pid);
+            }
+        }
+
+        // Hide apps that should NOT be visible
+        // Check current state first to avoid unnecessary operations
+        let pids_to_hide: Vec<_> = all_pids.difference(&globally_visible_pids).copied().collect();
+        for &pid in &pids_to_hide {
+            let is_hidden = crate::sys::app::is_app_hidden(pid);
+            if !is_hidden {
+                tracing::trace!("Hiding app {} (no windows in any active workspace globally)", pid);
                 if let Err(e) = self.hide_app(pid) {
                     tracing::warn!("Failed to hide app {}: {}", pid, e);
+                } else {
+                    // Verify the hide actually worked
+                    let still_visible = !crate::sys::app::is_app_hidden(pid);
+                    if still_visible {
+                        tracing::warn!("App {} reports as still visible after hide() call - may not respect hiding", pid);
+                    }
                 }
+            } else {
+                tracing::trace!("App {} already hidden, skipping hide", pid);
             }
         }
 
-        // Update tracking
-        self.workspace_switch_manager
-            .visible_apps_per_display
-            .insert(display, active_pids);
+        // Update tracking for each display
+        for display in 0..num_displays {
+            if self.layout_manager.layout_engine.active_workspace(display).is_none() {
+                continue;
+            }
+
+            let active_windows = self.layout_manager
+                .layout_engine
+                .windows_in_active_workspace(display);
+
+            let mut display_active_pids = HashSet::default();
+            for wid in &active_windows {
+                display_active_pids.insert(wid.pid);
+            }
+
+            self.workspace_switch_manager
+                .visible_apps_per_display
+                .insert(display, display_active_pids);
+        }
     }
 }

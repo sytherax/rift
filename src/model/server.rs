@@ -51,3 +51,14 @@ pub struct LayoutStateData {
     pub tiled_windows: Vec<WindowId>,
     pub focused_window: Option<WindowId>,
 }
+
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayData {
+    pub id: usize,
+    #[serde_as(as = "CGRectDef")]
+    pub frame: CGRect,
+    pub space_id: Option<u64>,
+    pub workspace_count: usize,
+    pub active_workspace: Option<String>,
+}

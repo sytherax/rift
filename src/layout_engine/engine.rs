@@ -128,8 +128,13 @@ impl LayoutEngine {
             None => return EventResponse::default(),
         };
 
+        let display_debug = format!("{}", display);
+        tracing::debug!("refocus_workspace: space={:?}, workspace_id={:?}, display_id={}", space, workspace_id, display_debug);
+
         let mut focus_window =
             self.virtual_workspace_manager.last_focused_window(display, workspace_id);
+
+        tracing::debug!("Last focused window for workspace {:?} on display_id {:?}: {:?}", workspace_id, display, focus_window);
 
         if focus_window.is_none() {
             if let Some(layout) = self.workspace_layouts.active(space, workspace_id) {
@@ -160,6 +165,9 @@ impl LayoutEngine {
             self.virtual_workspace_manager
                 .set_last_focused_window(display, workspace_id, None);
         }
+
+        tracing::debug!("refocus_workspace returning focus_window={:?} for workspace {:?} on display_id {:?}",
+                      focus_window, workspace_id, display);
 
         EventResponse {
             focus_window,
@@ -924,13 +932,11 @@ impl LayoutEngine {
         stack_line_thickness: f64,
         stack_line_horiz: crate::common::config::HorizontalPlacement,
         stack_line_vert: crate::common::config::VerticalPlacement,
-        get_window_size: F,
+        _get_window_size: F,
     ) -> Vec<(WindowId, CGRect)>
     where
         F: Fn(WindowId) -> CGSize,
     {
-        use crate::model::HideCorner;
-
         let mut positions = HashMap::default();
 
         if let Some(display) = self.virtual_workspace_manager.get_display_for_space(space) {
@@ -1030,16 +1036,6 @@ impl LayoutEngine {
         }
 
         positions.into_iter().collect()
-    }
-
-    fn get_app_bundle_id_for_window(&self, _window_id: WindowId) -> Option<String> {
-        // The bundle ID is stored in the app info, which we can access via the PID
-        // Note: This would need to be available from the reactor state, but since
-        // we're in the layout engine, we don't have direct access to that.
-        // For now, we'll return None, but this could be improved by passing
-        // app information through the layout calculation or storing it separately.
-
-        None
     }
 
     fn layout(&mut self, space: SpaceId) -> LayoutId {
@@ -1183,6 +1179,9 @@ impl LayoutEngine {
                 if let Some((target_display, workspace_id)) =
                     self.virtual_workspace_manager_mut().workspace_by_global_index(*workspace_index)
                 {
+                    tracing::debug!("SwitchToWorkspace({}): target_display_id={:?}, workspace_id={:?}, current_display_id={:?}, current_space={:?}",
+                                  workspace_index, target_display, workspace_id, display, space);
+
                     // Check if we're already on this workspace
                     if display == target_display &&
                        self.virtual_workspace_manager.active_workspace(display) == Some(workspace_id)
@@ -1206,11 +1205,17 @@ impl LayoutEngine {
 
                     // If the workspace is on a different display, we need to get the space for that display
                     let target_space = if target_display == display {
+                        tracing::debug!("Workspace {} is on current display_id {:?}, using current space {:?}",
+                                      workspace_index, display, space);
                         space
                     } else {
                         // Get the space for the target display
                         match self.virtual_workspace_manager.get_space_for_display(target_display) {
-                            Some(s) => s,
+                            Some(s) => {
+                                tracing::debug!("Workspace {} is on different display_id {}, got target space {:?}",
+                                              workspace_index, target_display, s);
+                                s
+                            }
                             None => {
                                 warn!("Cannot switch to workspace on display {} - no space mapping found", target_display);
                                 return EventResponse::default();
@@ -1218,6 +1223,7 @@ impl LayoutEngine {
                         }
                     };
 
+                    tracing::debug!("Setting workspace {:?} as active on display_id {}", workspace_id, target_display);
                     self.virtual_workspace_manager.set_active_workspace(target_display, workspace_id);
 
                     self.update_active_floating_windows(target_space);

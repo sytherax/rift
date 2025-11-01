@@ -206,6 +206,10 @@ impl AXUIElement {
 
     pub fn minimized(&self) -> Result<bool> { self.bool_attribute("AXMinimized") }
 
+    pub fn set_minimized(&self, minimized: bool) -> Result<()> {
+        self.set_bool_attribute("AXMinimized", minimized)
+    }
+
     pub fn fullscreen(&self) -> Result<bool> { self.bool_attribute("AXFullscreen") }
 
     pub fn title(&self) -> Result<String> {

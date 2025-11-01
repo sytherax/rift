@@ -132,8 +132,17 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     config.settings.default_disable |= opt.default_disable;
 
     if opt.validate {
-        LayoutEngine::load(restore_file()).unwrap();
-        return;
+        match LayoutEngine::load(restore_file()) {
+            Ok(_) => {
+                println!("State file is valid");
+                return;
+            }
+            Err(e) => {
+                eprintln!("Failed to load state file: {}", e);
+                eprintln!("Note: State format changed in multi-monitor update. State will be reset on next run.");
+                std::process::exit(1);
+            }
+        }
     }
 
     execute_startup_commands(&config.settings.run_on_start);
@@ -141,7 +150,22 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     let (broadcast_tx, broadcast_rx) = rift_wm::actor::channel();
 
     let layout = if opt.restore {
-        LayoutEngine::load(restore_file()).unwrap()
+        match LayoutEngine::load(restore_file()) {
+            Ok(layout) => {
+                println!("Restored layout from saved state");
+                layout
+            }
+            Err(e) => {
+                eprintln!("Failed to restore state: {}", e);
+                eprintln!("Note: State format may have changed. Starting with fresh state.");
+                eprintln!("Your configuration and keybindings are unaffected.");
+                LayoutEngine::new(
+                    &config.virtual_workspaces,
+                    &config.settings.layout,
+                    Some(broadcast_tx.clone()),
+                )
+            }
+        }
     } else {
         LayoutEngine::new(
             &config.virtual_workspaces,

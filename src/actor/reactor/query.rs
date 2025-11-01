@@ -5,7 +5,7 @@ use crate::actor::menu_bar;
 use crate::actor::reactor::{Event, Reactor};
 use crate::common::collections::HashSet;
 use crate::model::server::{
-    ApplicationData, LayoutStateData, WindowData, WorkspaceData, WorkspaceQueryResponse,
+    ApplicationData, DisplayData, LayoutStateData, WindowData, WorkspaceData, WorkspaceQueryResponse,
 };
 use crate::sys::screen::SpaceId;
 
@@ -15,6 +15,10 @@ impl Reactor {
             Event::QueryWorkspaces(response_tx) => {
                 let response = self.handle_workspace_query();
                 response_tx.send(response);
+            }
+            Event::QueryDisplays(response) => {
+                let displays = self.handle_displays_query();
+                response.send(displays);
             }
             Event::QueryWindows { space_id, response } => {
                 let windows = self.handle_windows_query(space_id);
@@ -151,6 +155,46 @@ impl Reactor {
         }
 
         WorkspaceQueryResponse { workspaces }
+    }
+
+    fn handle_displays_query(&mut self) -> Vec<DisplayData> {
+        self.space_manager
+            .screens
+            .iter()
+            .enumerate()
+            .map(|(display_id, screen)| {
+                let space_id = screen.space.map(|s| s.get());
+
+                let workspace_count = self
+                    .layout_manager
+                    .layout_engine
+                    .virtual_workspace_manager_mut()
+                    .list_workspaces(display_id)
+                    .len();
+
+                let active_workspace = self
+                    .layout_manager
+                    .layout_engine
+                    .active_workspace(display_id)
+                    .and_then(|ws_id| {
+                        self.layout_manager
+                            .layout_engine
+                            .virtual_workspace_manager_mut()
+                            .list_workspaces(display_id)
+                            .into_iter()
+                            .find(|(id, _)| *id == ws_id)
+                            .map(|(_, name)| name)
+                    });
+
+                DisplayData {
+                    id: display_id,
+                    frame: screen.frame,
+                    space_id,
+                    workspace_count,
+                    active_workspace,
+                }
+            })
+            .collect()
     }
 
     fn handle_windows_query(&self, space_id: Option<SpaceId>) -> Vec<WindowData> {

@@ -1,4 +1,4 @@
-use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_core_foundation::CGRect;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -85,16 +85,6 @@ impl VirtualWorkspace {
     pub fn last_focused(&self) -> Option<WindowId> { self.last_focused }
 
     pub fn window_count(&self) -> usize { self.windows.len() }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HideCorner {
-    BottomLeft,
-    BottomRight,
-}
-
-impl Default for HideCorner {
-    fn default() -> Self { HideCorner::BottomRight }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -527,49 +517,6 @@ impl VirtualWorkspaceManager {
             .filter(|(id, workspace)| workspace.display == display && Some(*id) != active_workspace_id)
             .flat_map(|(_, workspace)| workspace.windows())
             .collect()
-    }
-
-    pub fn calculate_hidden_position(
-        &self,
-        screen_frame: CGRect,
-        _window_index: usize,
-        original_size: CGSize,
-        corner: HideCorner,
-        app_bundle_id: Option<&str>,
-    ) -> CGRect {
-        let one_pixel_offset = if let Some(bundle_id) = app_bundle_id {
-            match bundle_id {
-                "us.zoom.xos" => CGPoint::new(0.0, 0.0),
-                _ => match corner {
-                    HideCorner::BottomLeft => CGPoint::new(1.0, -1.0),
-                    HideCorner::BottomRight => CGPoint::new(1.0, 1.0),
-                },
-            }
-        } else {
-            match corner {
-                HideCorner::BottomLeft => CGPoint::new(1.0, -1.0),
-                HideCorner::BottomRight => CGPoint::new(1.0, 1.0),
-            }
-        };
-
-        let hidden_point = match corner {
-            HideCorner::BottomLeft => {
-                let bottom_left = CGPoint::new(screen_frame.origin.x, screen_frame.max().y);
-                CGPoint::new(
-                    bottom_left.x + one_pixel_offset.x - original_size.width + 1.0,
-                    bottom_left.y + one_pixel_offset.y,
-                )
-            }
-            HideCorner::BottomRight => {
-                let bottom_right = CGPoint::new(screen_frame.max().x, screen_frame.max().y);
-                CGPoint::new(
-                    bottom_right.x - one_pixel_offset.x - 1.0, // -1 to keep 1px visible
-                    bottom_right.y - one_pixel_offset.y,
-                )
-            }
-        };
-
-        CGRect::new(hidden_point, original_size)
     }
 
     pub fn set_last_focused_window(

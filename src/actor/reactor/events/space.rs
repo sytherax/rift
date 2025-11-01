@@ -230,6 +230,10 @@ impl SpaceEventHandler {
             StaleCleanupState::Enabled
         };
         let mut ws_info_opt = Some(ws_info);
+
+        // Track if screens changed for app visibility update
+        let screens_changed = !frames.is_empty() || spaces.is_empty();
+
         if frames.is_empty() {
             if spaces.is_empty() {
                 if !reactor.space_manager.screens.is_empty() {
@@ -269,6 +273,12 @@ impl SpaceEventHandler {
             reactor.update_complete_window_server_info(info);
         }
         reactor.try_apply_pending_space_change();
+
+        // Update app visibility after display configuration changes
+        // This ensures apps are hidden/shown correctly when displays are connected/disconnected
+        if screens_changed {
+            reactor.update_app_visibility_global();
+        }
     }
 
     pub fn handle_space_changed(
