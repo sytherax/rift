@@ -2126,7 +2126,7 @@ impl Reactor {
         let display_id = display; // Avoid variable name conflict with tracing::field::display
 
         // Get active workspace for this display
-        let Some(active_workspace_id) = self.layout_manager.layout_engine.active_workspace(display) else {
+        let Some(_active_workspace_id) = self.layout_manager.layout_engine.active_workspace(display) else {
             return;
         };
 
@@ -2154,12 +2154,12 @@ impl Reactor {
         }
 
         // Apps to unhide: have windows in active workspace
+        // We always try to unhide, not just when the app reports as hidden,
+        // because the hidden state might not be accurate
         for &pid in &active_pids {
-            if crate::sys::app::is_app_hidden(pid) {
-                tracing::debug!("Unhiding app {} (has windows in active workspace on display {})", pid, display_id);
-                if let Err(e) = self.unhide_app(pid) {
-                    tracing::warn!("Failed to unhide app {}: {}", pid, e);
-                }
+            tracing::debug!("Unhiding app {} (has windows in active workspace on display {})", pid, display_id);
+            if let Err(e) = self.unhide_app(pid) {
+                tracing::warn!("Failed to unhide app {}: {}", pid, e);
             }
         }
 

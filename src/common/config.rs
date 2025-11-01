@@ -81,6 +81,10 @@ pub struct VirtualWorkspaceSettings {
     pub default_workspace: usize,
     #[serde(default)]
     pub app_rules: Vec<AppWorkspaceRule>,
+    /// Optional: Explicit workspace definitions with display assignments
+    /// If provided, overrides default_workspace_count and workspace_names
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceDefinition>,
 }
 
 // Allow specifying a workspace by numeric index or by name in the config.
@@ -90,6 +94,18 @@ pub struct VirtualWorkspaceSettings {
 pub enum WorkspaceSelector {
     Index(usize),
     Name(String),
+}
+
+/// Configuration for a specific workspace
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDefinition {
+    /// Name of the workspace
+    pub name: String,
+    /// Optional: Display index (0-based) to assign this workspace to
+    /// If None, workspace is created on all displays
+    #[serde(default)]
+    pub display: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -138,6 +154,7 @@ impl Default for VirtualWorkspaceSettings {
             workspace_names: default_workspace_names(),
             default_workspace: 0,
             app_rules: Vec::new(),
+            workspaces: Vec::new(),
         }
     }
 }
@@ -246,6 +263,29 @@ impl VirtualWorkspaceSettings {
                 } else if !seen_ax_subroles.insert(ax_sub) {
                     issues.push(format!("Duplicate ax_subrole '{}' in rule {}", ax_sub, index));
                 }
+            }
+        }
+
+        // Validate workspace definitions if provided
+        if !self.workspaces.is_empty() {
+            let mut seen_workspace_names = crate::common::collections::HashSet::default();
+
+            for (index, ws) in self.workspaces.iter().enumerate() {
+                if ws.name.is_empty() {
+                    issues.push(format!("Workspace definition {} has empty name", index));
+                }
+
+                if !seen_workspace_names.insert(&ws.name) {
+                    issues.push(format!("Duplicate workspace name '{}' in definition {}", ws.name, index));
+                }
+            }
+
+            // Note: We can't validate display indices here since we don't know how many displays
+            // will be available at runtime. This validation will happen during initialization.
+
+            // Warn if both workspaces and workspace_names are provided
+            if !self.workspace_names.is_empty() && self.workspaces.len() != self.workspace_names.len() {
+                issues.push("Both 'workspaces' and 'workspace_names' are provided. The 'workspaces' field will take precedence and 'workspace_names' will be ignored.".to_string());
             }
         }
 

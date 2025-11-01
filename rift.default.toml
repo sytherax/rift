@@ -181,9 +181,25 @@ workspace_auto_back_and_forth = false
 # Workspace names (indexed order). If fewer than default_workspace_count are provided,
 # remaining workspaces are named "Workspace X".
 # Do not provide more names than default_workspace_count.
-workspace_names = [
-	"first",
-	"second"
+# NOTE: workspace_names is ignored if 'workspaces' is provided below.
+
+# Workspace definitions with display assignments (optional)
+# If provided, this overrides default_workspace_count and workspace_names.
+# Each workspace can be assigned to a specific display (0-based index).
+# If 'display' is omitted, the workspace is created on all displays.
+#
+# Example for multi-monitor setup (2 displays):
+# workspaces = [
+#   { name = "web", display = 0 },      # First workspace on display 0
+#   { name = "code", display = 0 },     # Second workspace on display 0
+#   { name = "chat", display = 1 },     # First workspace on display 1
+#   { name = "media", display = 1 },    # Second workspace on display 1
+# ]
+workspaces = [
+	{ name = "web", display = 0 },
+	{ name = "code", display = 0 },
+	{ name = "chat", display = 1 },
+	{ name = "media", display = 1 },
 ]
 
 # App rules (automatic assignment)

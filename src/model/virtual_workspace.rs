@@ -120,6 +120,8 @@ pub struct VirtualWorkspaceManager {
     default_workspace_names: Vec<String>,
     #[serde(skip)]
     workspace_auto_back_and_forth: bool,
+    #[serde(skip)]
+    workspace_definitions: Vec<crate::common::config::WorkspaceDefinition>,
 }
 
 impl Default for VirtualWorkspaceManager {
@@ -150,6 +152,7 @@ impl VirtualWorkspaceManager {
             default_workspace_count: config.default_workspace_count,
             default_workspace_names: config.workspace_names.clone(),
             workspace_auto_back_and_forth: config.workspace_auto_back_and_forth,
+            workspace_definitions: config.workspaces.clone(),
         }
     }
 
@@ -158,22 +161,66 @@ impl VirtualWorkspaceManager {
             return;
         }
 
+        let display_id = display; // Avoid variable name conflict
         let mut ids = Vec::new();
-        let count = self.default_workspace_count.max(1).min(self.max_workspaces);
-        for i in 0..count {
-            let name = self
-                .default_workspace_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("Workspace {}", i + 1));
-            let ws = VirtualWorkspace::new(name, display);
-            let id = self.workspaces.insert(ws);
-            ids.push(id);
+
+        // Use workspace definitions if provided, otherwise fall back to default behavior
+        if !self.workspace_definitions.is_empty() {
+            // Create workspaces from workspace_definitions
+            for (_i, ws_def) in self.workspace_definitions.iter().enumerate() {
+                // If display is specified and doesn't match, skip this workspace
+                if let Some(target_display) = ws_def.display {
+                    if target_display != display_id {
+                        continue;
+                    }
+                }
+                // If display is None, create workspace on all displays
+                // If display matches current display, create workspace
+
+                let name = ws_def.name.clone();
+                let ws = VirtualWorkspace::new(name, display_id);
+                let id = self.workspaces.insert(ws);
+                ids.push(id);
+
+                if ids.len() >= self.max_workspaces {
+                    warn!(
+                        "Reached maximum workspace limit ({}) for display {}",
+                        self.max_workspaces, display_id
+                    );
+                    break;
+                }
+            }
+
+            // If no workspaces were created for this display (all had specific display assignments),
+            // create at least one default workspace
+            if ids.is_empty() {
+                warn!(
+                    "No workspaces configured for display {}, creating default workspace",
+                    display_id
+                );
+                let ws = VirtualWorkspace::new(format!("Workspace 1"), display_id);
+                let id = self.workspaces.insert(ws);
+                ids.push(id);
+            }
+        } else {
+            // Fall back to default behavior using workspace_names
+            let count = self.default_workspace_count.max(1).min(self.max_workspaces);
+            for i in 0..count {
+                let name = self
+                    .default_workspace_names
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Workspace {}", i + 1));
+                let ws = VirtualWorkspace::new(name, display_id);
+                let id = self.workspaces.insert(ws);
+                ids.push(id);
+            }
         }
-        self.workspaces_by_display.insert(display, ids.clone());
+
+        self.workspaces_by_display.insert(display_id, ids.clone());
 
         if let Some(&first_id) = ids.first() {
-            self.active_workspace_per_display.insert(display, (None, first_id));
+            self.active_workspace_per_display.insert(display_id, (None, first_id));
         }
     }
 
@@ -641,6 +688,28 @@ impl VirtualWorkspaceManager {
             .collect();
         //workspaces.sort_by(|a, b| a.1.cmp(&b.1));
         workspaces
+    }
+
+    /// Get workspace by global index across all displays
+    /// Returns (display, workspace_id) if found
+    pub fn workspace_by_global_index(&mut self, global_index: usize) -> Option<(DisplayId, VirtualWorkspaceId)> {
+        let mut current_index = 0;
+
+        // Iterate through displays in order
+        let mut displays: Vec<DisplayId> = self.workspaces_by_display.keys().copied().collect();
+        displays.sort();
+
+        for display in displays {
+            let workspaces = self.list_workspaces(display);
+            for (workspace_id, _name) in workspaces {
+                if current_index == global_index {
+                    return Some((display, workspace_id));
+                }
+                current_index += 1;
+            }
+        }
+
+        None
     }
 
     pub fn rename_workspace(

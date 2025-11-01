@@ -7,7 +7,7 @@ use crate::common::collections::HashSet;
 use crate::model::server::{
     ApplicationData, LayoutStateData, WindowData, WorkspaceData, WorkspaceQueryResponse,
 };
-use crate::sys::screen::{SpaceId, get_active_space_number};
+use crate::sys::screen::SpaceId;
 
 impl Reactor {
     pub(super) fn handle_query(&mut self, event: Event) {
@@ -70,31 +70,23 @@ impl Reactor {
     fn handle_workspace_query(&mut self) -> WorkspaceQueryResponse {
         let mut workspaces = Vec::new();
 
-        let space_id = get_active_space_number()
-            .or_else(|| self.space_manager.screens.first().and_then(|s| s.space));
+        // Query workspaces for ALL displays, not just the active one
+        let num_displays = self.space_manager.screens.len();
 
-        // Convert SpaceId to DisplayId for workspace queries
-        let display_id = space_id.and_then(|space| self.display_for_space(space));
+        let mut global_index = 0;
+        for display in 0..num_displays {
+            let space_id = self.space_manager.screens.get(display).and_then(|s| s.space);
 
-        let workspace_list: Vec<(crate::model::VirtualWorkspaceId, String)> =
-            if let Some(display) = display_id {
+            let workspace_list: Vec<(crate::model::VirtualWorkspaceId, String)> =
                 self.layout_manager
                     .layout_engine
                     .virtual_workspace_manager_mut()
-                    .list_workspaces(display)
-            } else {
-                Vec::new()
-            };
+                    .list_workspaces(display);
 
-        for (index, (workspace_id, workspace_name)) in workspace_list.iter().enumerate() {
-            let is_active = if let Some(display) = display_id {
-                self.layout_manager.layout_engine.active_workspace(display) == Some(*workspace_id)
-            } else {
-                false
-            };
+            for (_local_index, (workspace_id, workspace_name)) in workspace_list.iter().enumerate() {
+                let is_active = self.layout_manager.layout_engine.active_workspace(display) == Some(*workspace_id);
 
-            let workspace_windows_ids: Vec<crate::actor::app::WindowId> =
-                if let Some(display) = display_id {
+                let workspace_windows_ids: Vec<crate::actor::app::WindowId> =
                     if is_active {
                         self.layout_manager.layout_engine.windows_in_active_workspace(display)
                     } else {
@@ -104,63 +96,58 @@ impl Reactor {
                             .workspace_info(display, *workspace_id)
                             .map(|ws| ws.windows().collect())
                             .unwrap_or_default()
-                    }
-                } else {
-                    Vec::new()
-                };
+                    };
 
-            let predicted_positions = if !is_active {
-                if let Some(space) = space_id {
-                    let screen_frame = self
-                        .space_manager
-                        .screens
-                        .iter()
-                        .find(|s| s.space == Some(space))
-                        .map(|s| s.frame)
-                        .or_else(|| self.space_manager.screens.first().map(|s| s.frame));
+                let predicted_positions = if !is_active {
+                    if let Some(space) = space_id {
+                        let screen_frame = self.space_manager.screens.get(display).map(|s| s.frame);
 
-                    if let Some(frame) = screen_frame {
-                        self.layout_manager.layout_engine.calculate_layout_for_workspace(
-                            space,
-                            *workspace_id,
-                            frame,
-                            self.config_manager.config.settings.ui.stack_line.thickness(),
-                            self.config_manager.config.settings.ui.stack_line.horiz_placement,
-                            self.config_manager.config.settings.ui.stack_line.vert_placement,
-                        )
+                        if let Some(frame) = screen_frame {
+                            self.layout_manager.layout_engine.calculate_layout_for_workspace(
+                                space,
+                                *workspace_id,
+                                frame,
+                                self.config_manager.config.settings.ui.stack_line.thickness(),
+                                self.config_manager.config.settings.ui.stack_line.horiz_placement,
+                                self.config_manager.config.settings.ui.stack_line.vert_placement,
+                            )
+                        } else {
+                            vec![]
+                        }
                     } else {
                         vec![]
                     }
                 } else {
                     vec![]
-                }
-            } else {
-                vec![]
-            };
+                };
 
-            let predicted_map: std::collections::HashMap<WindowId, CGRect> =
-                predicted_positions.into_iter().collect();
+                let predicted_map: std::collections::HashMap<WindowId, CGRect> =
+                    predicted_positions.into_iter().collect();
 
-            let mut windows: Vec<WindowData> = Vec::new();
-            for wid in workspace_windows_ids.into_iter() {
-                if let Some(mut wd) = self.create_window_data(wid) {
-                    if !is_active {
-                        if let Some(pred) = predicted_map.get(&wid).copied() {
-                            wd.frame = pred;
+                let mut windows: Vec<WindowData> = Vec::new();
+                for wid in workspace_windows_ids.into_iter() {
+                    if let Some(mut wd) = self.create_window_data(wid) {
+                        if !is_active {
+                            if let Some(pred) = predicted_map.get(&wid).copied() {
+                                wd.frame = pred;
+                            }
                         }
+                        windows.push(wd);
                     }
-                    windows.push(wd);
                 }
-            }
 
-            workspaces.push(WorkspaceData {
-                id: format!("{:?}", workspace_id),
-                name: workspace_name.to_string(),
-                is_active,
-                window_count: windows.len(),
-                windows,
-                index,
-            });
+                workspaces.push(WorkspaceData {
+                    id: format!("{:?}", workspace_id),
+                    name: workspace_name.to_string(),
+                    display,
+                    is_active,
+                    window_count: windows.len(),
+                    windows,
+                    index: global_index,
+                });
+
+                global_index += 1;
+            }
         }
 
         WorkspaceQueryResponse { workspaces }

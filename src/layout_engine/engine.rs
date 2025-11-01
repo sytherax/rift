@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use objc2_core_foundation::{CGRect, CGSize};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{Direction, FloatingManager, LayoutId, LayoutSystemKind, WorkspaceLayouts};
 use crate::actor::app::{AppInfo, WindowId, pid_t};
@@ -960,19 +960,10 @@ impl LayoutEngine {
                 }
             }
 
-            let hidden_windows = self.virtual_workspace_manager.windows_in_inactive_workspaces(display);
-            for (index, wid) in hidden_windows.into_iter().enumerate() {
-                let original_size = get_window_size(wid);
-                let app_bundle_id = self.get_app_bundle_id_for_window(wid);
-                let hidden_rect = self.virtual_workspace_manager.calculate_hidden_position(
-                    screen,
-                    index,
-                    original_size,
-                    HideCorner::BottomRight,
-                    app_bundle_id.as_deref(),
-                );
-                positions.insert(wid, hidden_rect);
-            }
+            // NOTE: We used to move windows from inactive workspaces to offscreen positions here.
+            // This has been removed in favor of using native app hiding (hide/unhide).
+            // Windows in inactive workspaces are now handled by hiding their apps instead of
+            // repositioning them offscreen.
         }
 
         positions.into_iter().collect()
@@ -1052,8 +1043,18 @@ impl LayoutEngine {
     }
 
     fn layout(&mut self, space: SpaceId) -> LayoutId {
-        let display = self.virtual_workspace_manager.get_display_for_space(space)
-            .expect("No display found for space");
+        let display = match self.virtual_workspace_manager.get_display_for_space(space) {
+            Some(d) => d,
+            None => {
+                // During early initialization, the space-to-display mapping might not be established yet.
+                // In this case, we assume display 0 as a fallback.
+                tracing::warn!(
+                    "No display found for space {:?}, assuming display 0. This should only happen during early initialization.",
+                    space.get()
+                );
+                0
+            }
+        };
 
         let workspace_id = match self.virtual_workspace_manager.active_workspace(display) {
             Some(ws) => ws,
@@ -1178,10 +1179,13 @@ impl LayoutEngine {
                 EventResponse::default()
             }
             LayoutCommand::SwitchToWorkspace(workspace_index) => {
-                let workspaces = self.virtual_workspace_manager_mut().list_workspaces(display);
-                if let Some((workspace_id, _)) = workspaces.get(*workspace_index) {
-                    let workspace_id = *workspace_id;
-                    if self.virtual_workspace_manager.active_workspace(display) == Some(workspace_id)
+                // Use global workspace indexing across all displays
+                if let Some((target_display, workspace_id)) =
+                    self.virtual_workspace_manager_mut().workspace_by_global_index(*workspace_index)
+                {
+                    // Check if we're already on this workspace
+                    if display == target_display &&
+                       self.virtual_workspace_manager.active_workspace(display) == Some(workspace_id)
                     {
                         // Check if workspace_auto_back_and_forth is enabled
                         if self.virtual_workspace_manager.workspace_auto_back_and_forth() {
@@ -1199,14 +1203,29 @@ impl LayoutEngine {
                         }
                         return EventResponse::default();
                     }
-                    self.virtual_workspace_manager.set_active_workspace(display, workspace_id);
 
-                    self.update_active_floating_windows(space);
+                    // If the workspace is on a different display, we need to get the space for that display
+                    let target_space = if target_display == display {
+                        space
+                    } else {
+                        // Get the space for the target display
+                        match self.virtual_workspace_manager.get_space_for_display(target_display) {
+                            Some(s) => s,
+                            None => {
+                                warn!("Cannot switch to workspace on display {} - no space mapping found", target_display);
+                                return EventResponse::default();
+                            }
+                        }
+                    };
 
-                    self.broadcast_workspace_changed(space);
-                    self.broadcast_windows_changed(space);
+                    self.virtual_workspace_manager.set_active_workspace(target_display, workspace_id);
 
-                    return self.refocus_workspace(space, workspace_id);
+                    self.update_active_floating_windows(target_space);
+
+                    self.broadcast_workspace_changed(target_space);
+                    self.broadcast_windows_changed(target_space);
+
+                    return self.refocus_workspace(target_space, workspace_id);
                 }
                 EventResponse::default()
             }
@@ -1228,11 +1247,13 @@ impl LayoutEngine {
                     None => return EventResponse::default(),
                 };
 
-                let workspaces = self.virtual_workspace_manager_mut().list_workspaces(op_display);
-                let Some((target_workspace_id, _)) = workspaces.get(*workspace_index) else {
+                // Use global workspace indexing to support cross-display moves
+                let Some((target_display, target_workspace_id)) =
+                    self.virtual_workspace_manager_mut().workspace_by_global_index(*workspace_index)
+                else {
+                    warn!("Cannot move window to workspace index {} - workspace not found", workspace_index);
                     return EventResponse::default();
                 };
-                let target_workspace_id = *target_workspace_id;
 
                 let Some(current_workspace_id) =
                     self.virtual_workspace_manager.workspace_for_window(op_display, focused_window)
@@ -1240,12 +1261,26 @@ impl LayoutEngine {
                     return EventResponse::default();
                 };
 
-                if current_workspace_id == target_workspace_id {
+                if current_workspace_id == target_workspace_id && op_display == target_display {
                     return EventResponse::default();
                 }
 
+                // Get the target space for cross-display moves
+                let target_space = if target_display == op_display {
+                    op_space
+                } else {
+                    match self.virtual_workspace_manager.get_space_for_display(target_display) {
+                        Some(s) => s,
+                        None => {
+                            warn!("Cannot move window to display {} - no space mapping found", target_display);
+                            return EventResponse::default();
+                        }
+                    }
+                };
+
                 let is_floating = self.floating.is_floating(focused_window);
 
+                // Remove from current workspace/display
                 if is_floating {
                     self.floating.remove_active(op_space, focused_window.pid, focused_window);
                 } else if let Some(_layout) =
@@ -1254,12 +1289,14 @@ impl LayoutEngine {
                     self.tree.remove_window(focused_window);
                 }
 
+                // Assign to target workspace on target display
                 let assigned = self.virtual_workspace_manager.assign_window_to_workspace(
-                    op_display,
+                    target_display,
                     focused_window,
                     target_workspace_id,
                 );
                 if !assigned {
+                    // Rollback - add back to original workspace
                     if is_floating {
                         self.floating.add_active(op_space, focused_window.pid, focused_window);
                     } else if let Some(prev_layout) =
@@ -1270,25 +1307,30 @@ impl LayoutEngine {
                     return EventResponse::default();
                 }
 
+                // Add to target workspace's layout (use target_space)
                 if !is_floating {
                     if let Some(target_layout) =
-                        self.workspace_layouts.active(op_space, target_workspace_id)
+                        self.workspace_layouts.active(target_space, target_workspace_id)
                     {
                         self.tree.add_window_after_selection(target_layout, focused_window);
                     }
                 }
 
-                let active_workspace = self.virtual_workspace_manager.active_workspace(op_display);
+                let source_active_workspace = self.virtual_workspace_manager.active_workspace(op_display);
+                let target_active_workspace = self.virtual_workspace_manager.active_workspace(target_display);
 
-                if Some(target_workspace_id) == active_workspace {
+                // If moving to the active workspace on the target display
+                if Some(target_workspace_id) == target_active_workspace {
                     if is_floating {
-                        self.floating.add_active(op_space, focused_window.pid, focused_window);
+                        self.floating.add_active(target_space, focused_window.pid, focused_window);
                     }
                     return EventResponse {
                         focus_window: Some(focused_window),
                         raise_windows: vec![],
                     };
-                } else if Some(current_workspace_id) == active_workspace {
+                }
+                // If moving from the active workspace on the source display
+                else if Some(current_workspace_id) == source_active_workspace {
                     self.focused_window = None;
                     self.virtual_workspace_manager.set_last_focused_window(
                         op_display,
@@ -1307,12 +1349,17 @@ impl LayoutEngine {
                 }
 
                 self.virtual_workspace_manager.set_last_focused_window(
-                    op_display,
+                    target_display,
                     target_workspace_id,
                     Some(focused_window),
                 );
 
+                // Broadcast changes for both source and target displays
                 self.broadcast_windows_changed(op_space);
+                if target_space != op_space {
+                    self.broadcast_windows_changed(target_space);
+                }
+
                 EventResponse::default()
             }
             LayoutCommand::CreateWorkspace => {

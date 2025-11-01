@@ -15,6 +15,7 @@ pub struct WorkspaceData {
     pub id: String,
     pub index: usize,
     pub name: String,
+    pub display: usize,
     pub is_active: bool,
     pub window_count: usize,
     pub windows: Vec<WindowData>,

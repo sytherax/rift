@@ -71,11 +71,11 @@ impl CommandEventHandler {
         reactor.handle_layout_response(response);
 
         // Update app visibility after workspace switch
+        // We need to update ALL displays because an app might have windows on multiple displays
         if is_workspace_switch {
-            if let Some(space) = reactor.workspace_command_space() {
-                if let Some(display) = reactor.display_for_space(space) {
-                    reactor.update_app_visibility_for_display(display);
-                }
+            let num_displays = reactor.space_manager.screens.len();
+            for display in 0..num_displays {
+                reactor.update_app_visibility_for_display(display);
             }
         }
     }

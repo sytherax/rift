@@ -400,11 +400,38 @@ impl NSRunningApplicationExt for NSRunningApplication {
     fn localized_name(&self) -> Option<Retained<NSString>> { self.localizedName() }
 
     fn hide_app(&self) -> bool {
-        unsafe { msg_send![self, hide] }
+        let pid = self.pid();
+        tracing::debug!("Attempting to hide app {} (is_hidden: {})", pid, self.is_hidden());
+
+        let result = unsafe { msg_send![self, hide] };
+
+        tracing::debug!("Hide result for app {}: returned {}, is_hidden after: {}",
+                       pid, result, self.is_hidden());
+
+        result
     }
 
     fn unhide_app(&self) -> bool {
-        unsafe { msg_send![self, unhideWithoutActivation] }
+        // NSRunningApplication doesn't have a direct unhide method
+        // We use activateWithOptions with NSApplicationActivateIgnoringOtherApps
+        // which unhides the app without stealing focus from other apps
+        const NSApplicationActivateIgnoringOtherApps: usize = 1 << 1; // 0x2
+
+        let pid = self.pid();
+        let was_hidden = self.is_hidden();
+
+        tracing::debug!("Attempting to unhide app {} (was_hidden: {})", pid, was_hidden);
+
+        let result = unsafe {
+            let result: bool = msg_send![self, activateWithOptions: NSApplicationActivateIgnoringOtherApps];
+            result
+        };
+
+        let is_hidden_after = self.is_hidden();
+        tracing::debug!("Unhide result for app {}: activateWithOptions returned {}, is_hidden after: {}",
+                       pid, result, is_hidden_after);
+
+        result
     }
 
     fn is_hidden(&self) -> bool {
