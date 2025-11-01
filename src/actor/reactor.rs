@@ -220,6 +220,12 @@ pub enum Event {
         app_info: AppInfo,
         windows: Vec<WindowServerInfo>,
     },
+
+    /// Hide an application (for workspace switching)
+    HideApp(pid_t),
+
+    /// Unhide an application (for workspace switching)
+    UnhideApp(pid_t),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -771,6 +777,16 @@ impl Reactor {
             Event::Command(Command::Reactor(ReactorCommand::DismissMissionControl)) => {
                 CommandEventHandler::handle_command_reactor_dismiss_mission_control(self);
             }
+            Event::HideApp(pid) => {
+                if let Err(e) = self.hide_app(pid) {
+                    tracing::warn!("Failed to hide app {}: {}", pid, e);
+                }
+            }
+            Event::UnhideApp(pid) => {
+                if let Err(e) = self.unhide_app(pid) {
+                    tracing::warn!("Failed to unhide app {}: {}", pid, e);
+                }
+            }
             _ => (),
         }
         if let Some(raised_window) = raised_window {
@@ -960,8 +976,15 @@ impl Reactor {
     }
 
     fn set_screen_spaces(&mut self, spaces: &[Option<SpaceId>]) {
-        for (space, screen) in spaces.iter().copied().zip(&mut self.space_manager.screens) {
+        for (display_idx, (space, screen)) in spaces.iter().copied().zip(&mut self.space_manager.screens).enumerate() {
             screen.space = space;
+            // Update the VirtualWorkspaceManager's display_to_space mapping
+            if let Some(space_id) = space {
+                self.layout_manager
+                    .layout_engine
+                    .virtual_workspace_manager_mut()
+                    .update_display_space_mapping(display_idx, space_id);
+            }
         }
     }
 
@@ -2053,5 +2076,25 @@ impl Reactor {
             .windows
             .get(&window_id)
             .and_then(|window_state| self.display_for_window_frame(&window_state.frame_monotonic))
+    }
+
+    /// Hide an application by its process ID
+    fn hide_app(&self, pid: pid_t) -> Result<(), String> {
+        if crate::sys::app::hide_app(pid) {
+            tracing::debug!("Successfully hid app with pid {}", pid);
+            Ok(())
+        } else {
+            Err(format!("Failed to hide app with pid {}", pid))
+        }
+    }
+
+    /// Unhide an application by its process ID
+    fn unhide_app(&self, pid: pid_t) -> Result<(), String> {
+        if crate::sys::app::unhide_app(pid) {
+            tracing::debug!("Successfully unhid app with pid {}", pid);
+            Ok(())
+        } else {
+            Err(format!("Failed to unhide app with pid {}", pid))
+        }
     }
 }

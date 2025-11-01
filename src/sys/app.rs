@@ -383,6 +383,9 @@ pub trait NSRunningApplicationExt {
     fn pid(&self) -> pid_t;
     fn bundle_id(&self) -> Option<Retained<NSString>>;
     fn localized_name(&self) -> Option<Retained<NSString>>;
+    fn hide_app(&self) -> bool;
+    fn unhide_app(&self) -> bool;
+    fn is_hidden(&self) -> bool;
 }
 
 impl NSRunningApplicationExt for NSRunningApplication {
@@ -395,6 +398,18 @@ impl NSRunningApplicationExt for NSRunningApplication {
     fn bundle_id(&self) -> Option<Retained<NSString>> { self.bundleIdentifier() }
 
     fn localized_name(&self) -> Option<Retained<NSString>> { self.localizedName() }
+
+    fn hide_app(&self) -> bool {
+        unsafe { msg_send![self, hide] }
+    }
+
+    fn unhide_app(&self) -> bool {
+        unsafe { msg_send![self, unhideWithoutActivation] }
+    }
+
+    fn is_hidden(&self) -> bool {
+        self.isHidden()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -495,4 +510,27 @@ fn bundle_info_for_pid(pid: pid_t) -> (Option<String>, Option<PathBuf>) {
             (bundle_id, path)
         })
         .unwrap_or((None, None))
+}
+
+/// Hide an application by its process ID
+/// Returns true if the app was successfully hidden
+pub fn hide_app(pid: pid_t) -> bool {
+    NSRunningApplication::with_process_id(pid)
+        .map(|app| app.hide_app())
+        .unwrap_or(false)
+}
+
+/// Unhide an application by its process ID without activating it
+/// Returns true if the app was successfully unhidden
+pub fn unhide_app(pid: pid_t) -> bool {
+    NSRunningApplication::with_process_id(pid)
+        .map(|app| app.unhide_app())
+        .unwrap_or(false)
+}
+
+/// Check if an application is currently hidden
+pub fn is_app_hidden(pid: pid_t) -> bool {
+    NSRunningApplication::with_process_id(pid)
+        .map(|app| app.is_hidden())
+        .unwrap_or(false)
 }
