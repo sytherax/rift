@@ -309,6 +309,12 @@ impl AnimationManager {
                 continue;
             }
             any_frame_changed = true;
+
+            if target_frame.origin.x < -5000.0 || target_frame.origin.y > 5000.0 {
+                println!("[INSTANT_LAYOUT] Moving window {:?} offscreen: current={:?} -> target={:?}",
+                         wid, current_frame, target_frame);
+            }
+
             trace!(
                 ?wid,
                 ?current_frame,
@@ -356,6 +362,15 @@ impl AnimationManager {
             }
 
             let frames_to_send = frames.clone();
+
+            // Log if we're sending offscreen positions
+            for (wid, frame) in &frames_to_send {
+                if frame.origin.x < -5000.0 {
+                    println!("[INSTANT_LAYOUT] Sending offscreen request for window {:?} to pid {}: {:?}",
+                             wid, pid, frame);
+                }
+            }
+
             if let Err(e) = handle.send(Request::SetBatchWindowFrame(frames_to_send, txid)) {
                 debug!(
                     ?pid,

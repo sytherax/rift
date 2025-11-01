@@ -16,7 +16,6 @@ pub struct CommandEventHandler;
 impl CommandEventHandler {
     pub fn handle_command_layout(reactor: &mut Reactor, cmd: LayoutCommand) {
         info!(?cmd);
-        println!("[COMMAND] handle_command_layout: {:?}", cmd);
 
         let visible_screens: Vec<_> = reactor
             .space_manager
@@ -33,14 +32,10 @@ impl CommandEventHandler {
                 | LayoutCommand::SwitchToLastWorkspace
         );
 
-        let is_window_workspace_change = matches!(
+        let _is_window_workspace_change = matches!(
             cmd,
             LayoutCommand::MoveWindowToWorkspace(_)
         );
-
-        if is_window_workspace_change {
-            println!("[COMMAND] MoveWindowToWorkspace detected");
-        }
 
         if is_workspace_switch {
             if let Some(space) = reactor.workspace_command_space() {
@@ -76,6 +71,7 @@ impl CommandEventHandler {
         };
 
         reactor.workspace_switch_manager.workspace_switch_state = if is_workspace_switch {
+            println!("[COMMAND_HANDLER] Setting workspace_switch_state = Active");
             WorkspaceSwitchState::Active
         } else {
             WorkspaceSwitchState::Inactive
@@ -83,13 +79,17 @@ impl CommandEventHandler {
 
         // IMPORTANT: Update app visibility BEFORE handling the layout response
         // This ensures apps are unhidden before we try to focus their windows
-        if is_workspace_switch || is_window_workspace_change {
-            reactor.update_app_visibility_global();
-        }
+        // NOTE: We DON'T call update_app_visibility_global() anymore because we're using
+        // per-window OrderOut/OrderIn instead of app-level hiding
+        // if is_workspace_switch || is_window_workspace_change {
+        //     reactor.update_app_visibility_global();
+        // }
 
-        println!("[COMMAND] About to handle_layout_response with focus_window={:?}, raise_windows={:?}",
-               response.focus_window, response.raise_windows);
+        println!("[COMMAND_HANDLER] About to call handle_layout_response, workspace_switch_state={:?}",
+                 reactor.workspace_switch_manager.workspace_switch_state);
         reactor.handle_layout_response(response);
+        println!("[COMMAND_HANDLER] After handle_layout_response, workspace_switch_state={:?}",
+                 reactor.workspace_switch_manager.workspace_switch_state);
     }
 
     pub fn handle_command_metrics(_reactor: &mut Reactor, cmd: MetricsCommand) {

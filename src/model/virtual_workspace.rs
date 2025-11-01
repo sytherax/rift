@@ -519,6 +519,16 @@ impl VirtualWorkspaceManager {
             .collect()
     }
 
+    /// Returns an iterator over all windows in a specific workspace
+    pub fn windows_in_workspace(&self, display: DisplayId, workspace_id: VirtualWorkspaceId) -> impl Iterator<Item = WindowId> + '_ {
+        self.workspaces
+            .get(workspace_id)
+            .filter(|ws| ws.display == display)
+            .map(|ws| ws.windows())
+            .into_iter()
+            .flatten()
+    }
+
     pub fn set_last_focused_window(
         &mut self,
         display: DisplayId,

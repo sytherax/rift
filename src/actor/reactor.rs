@@ -820,13 +820,17 @@ impl Reactor {
 
         let mut layout_changed = false;
         if !self.is_in_drag() || window_was_destroyed {
+            // Check active_workspace_switch instead of workspace_switch_state
+            // because workspace_switch_state can be reset by nested event handlers
+            let is_ws_switch = self.workspace_switch_manager.active_workspace_switch.is_some();
+            println!("[HANDLE_EVENT] Before update_layout: workspace_switch_state={:?}, active_workspace_switch={:?}, is_ws_switch={}",
+                     self.workspace_switch_manager.workspace_switch_state,
+                     self.workspace_switch_manager.active_workspace_switch,
+                     is_ws_switch);
             layout_changed = self
                 .update_layout(
                     is_resize,
-                    matches!(
-                        self.workspace_switch_manager.workspace_switch_state,
-                        WorkspaceSwitchState::Active
-                    ),
+                    is_ws_switch,
                 )
                 .unwrap_or_else(|e| {
                     warn!("Layout update failed: {}", e);
@@ -835,6 +839,7 @@ impl Reactor {
             self.maybe_send_menu_update();
         }
 
+        println!("[HANDLE_EVENT] Setting workspace_switch_state = Inactive");
         self.workspace_switch_manager.workspace_switch_state = WorkspaceSwitchState::Inactive;
         if self.workspace_switch_manager.active_workspace_switch.is_some() && !layout_changed {
             self.workspace_switch_manager.active_workspace_switch = None;

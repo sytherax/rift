@@ -98,11 +98,37 @@ pub struct LayoutEngine {
     layout_settings: LayoutSettings,
     #[serde(skip)]
     broadcast_tx: Option<BroadcastSender>,
+    #[serde(skip)]
+    offscreen_windows: HashMap<WindowId, usize>, // Maps window to its owning display
+    #[serde(skip)]
+    pub positioned_windows_this_cycle: HashMap<WindowId, CGRect>, // Track windows positioned in current layout cycle
 }
 
 impl LayoutEngine {
     pub fn set_layout_settings(&mut self, settings: &LayoutSettings) {
         self.layout_settings = settings.clone();
+    }
+
+    pub fn windows_to_hide(&self) -> impl Iterator<Item = WindowId> + '_ {
+        self.offscreen_windows.keys().copied()
+    }
+
+    pub fn is_window_offscreen(&self, wid: WindowId) -> bool {
+        self.offscreen_windows.contains_key(&wid)
+    }
+
+    /// Clear offscreen status for windows in a specific workspace on a display
+    /// This should be called when switching TO a workspace, before refocusing
+    pub fn clear_offscreen_for_workspace(&mut self, display: usize, workspace_id: VirtualWorkspaceId) {
+        let windows_in_workspace: Vec<WindowId> = self.virtual_workspace_manager
+            .windows_in_workspace(display, workspace_id)
+            .collect();
+
+        for wid in windows_in_workspace {
+            if self.offscreen_windows.remove(&wid).is_some() {
+                println!("[OFFSCREEN] Cleared offscreen status for window {:?} when switching to workspace {:?}", wid, workspace_id);
+            }
+        }
     }
 
     fn active_floating_windows_flat(&self, space: SpaceId) -> Vec<WindowId> {
@@ -138,19 +164,31 @@ impl LayoutEngine {
         println!("[REFOCUS] Last focused window for workspace {:?} on display_id {}: {:?}", workspace_id, display_debug, focus_window);
         tracing::debug!("Last focused window for workspace {:?} on display_id {}: {:?}", workspace_id, display_debug, focus_window);
 
+        // Filter out offscreen windows
+        if let Some(wid) = focus_window {
+            if self.is_window_offscreen(wid) {
+                println!("[REFOCUS] Last focused window {:?} is offscreen, ignoring", wid);
+                focus_window = None;
+            }
+        }
+
         if focus_window.is_none() {
             if let Some(layout) = self.workspace_layouts.active(space, workspace_id) {
                 let selected = self.tree.selected_window(layout);
                 let visible = self.tree.visible_windows_in_layout(layout);
-                focus_window = selected.or_else(|| visible.first().copied());
+                focus_window = selected
+                    .filter(|wid| !self.is_window_offscreen(*wid))
+                    .or_else(|| visible.iter().find(|wid| !self.is_window_offscreen(**wid)).copied());
             }
         }
 
         if focus_window.is_none() {
             let floating_windows = self.active_floating_windows_in_workspace(space);
-            let floating_focus =
-                self.floating.last_focus().filter(|wid| floating_windows.contains(wid));
-            focus_window = floating_focus.or_else(|| floating_windows.first().copied());
+            let floating_focus = self.floating.last_focus()
+                .filter(|wid| floating_windows.contains(wid) && !self.is_window_offscreen(*wid));
+            focus_window = floating_focus.or_else(||
+                floating_windows.iter().find(|wid| !self.is_window_offscreen(**wid)).copied()
+            );
         }
 
         if let Some(wid) = focus_window {
@@ -515,6 +553,8 @@ impl LayoutEngine {
             virtual_workspace_manager,
             layout_settings: layout_settings.clone(),
             broadcast_tx,
+            offscreen_windows: HashMap::default(),
+            positioned_windows_this_cycle: HashMap::default(),
         }
     }
 
@@ -1078,7 +1118,7 @@ impl LayoutEngine {
     }
 
     pub fn calculate_layout_with_virtual_workspaces<F>(
-        &self,
+        &mut self,
         space: SpaceId,
         screen: CGRect,
         stack_line_thickness: f64,
@@ -1092,7 +1132,9 @@ impl LayoutEngine {
         let mut positions = HashMap::default();
 
         if let Some(display) = self.virtual_workspace_manager.get_display_for_space(space) {
+            println!("[LAYOUT] Display {}: space {:?}", display, space);
             if let Some(active_workspace_id) = self.virtual_workspace_manager.active_workspace(display) {
+                println!("[LAYOUT] Display {}: active_workspace={:?}", display, active_workspace_id);
                 if let Some(layout) = self.workspace_layouts.active(space, active_workspace_id) {
                     let tiled_positions = self.tree.calculate_layout(
                         layout,
@@ -1104,7 +1146,30 @@ impl LayoutEngine {
                         stack_line_vert,
                     );
                     for (wid, rect) in tiled_positions {
-                        positions.insert(wid, rect);
+                        // Check which display this window actually belongs to
+                        let window_workspace_d0 = self.virtual_workspace_manager.workspace_for_window(0, wid);
+                        let window_workspace_d1 = self.virtual_workspace_manager.workspace_for_window(1, wid);
+                        println!("[LAYOUT] Display {}: tiled window {:?} -> {:?} (workspace on D0={:?}, D1={:?})",
+                                 display, wid, rect, window_workspace_d0, window_workspace_d1);
+
+                        // Only position this window if it actually belongs to THIS display
+                        let window_belongs_to_this_display = self.virtual_workspace_manager
+                            .workspace_for_window(display, wid)
+                            .is_some();
+
+                        if !window_belongs_to_this_display {
+                            println!("[LAYOUT] Display {}: SKIP window {:?} - doesn't belong to this display", display, wid);
+                            continue;
+                        }
+
+                        // Check if this window was already positioned by another display in this cycle
+                        if let Some(&existing_rect) = self.positioned_windows_this_cycle.get(&wid) {
+                            println!("[LAYOUT] Display {}: window {:?} already positioned at {:?}, using existing", display, wid, existing_rect);
+                            positions.insert(wid, existing_rect);
+                        } else {
+                            positions.insert(wid, rect);
+                            self.positioned_windows_this_cycle.insert(wid, rect);
+                        }
                     }
                 }
 
@@ -1113,15 +1178,55 @@ impl LayoutEngine {
                     .get_workspace_floating_positions(display, active_workspace_id);
                 for (window_id, stored_position) in floating_positions {
                     if self.floating.is_floating(window_id) {
-                        positions.insert(window_id, stored_position);
+                        // Only position this window if it actually belongs to THIS display
+                        let window_belongs_to_this_display = self.virtual_workspace_manager
+                            .workspace_for_window(display, window_id)
+                            .is_some();
+
+                        if !window_belongs_to_this_display {
+                            println!("[LAYOUT] Display {}: SKIP floating window {:?} - doesn't belong to this display", display, window_id);
+                            continue;
+                        }
+
+                        // Check if this window was already positioned by another display in this cycle
+                        if let Some(&existing_rect) = self.positioned_windows_this_cycle.get(&window_id) {
+                            positions.insert(window_id, existing_rect);
+                        } else {
+                            positions.insert(window_id, stored_position);
+                            self.positioned_windows_this_cycle.insert(window_id, stored_position);
+                        }
                     }
                 }
             }
 
-            // NOTE: We rely on app-level hiding (hide/unhide) to manage window visibility.
-            // This means apps are hidden/shown as a whole, not individual windows.
-            // Limitation: If an app has windows in both active and inactive workspaces,
-            // all windows will be visible (since the app must be unhidden for the active window).
+            // Get windows in THIS display's inactive workspaces
+            let inactive_windows_on_this_display = self.virtual_workspace_manager
+                .windows_in_inactive_workspaces(display);
+
+            println!("[OFFSCREEN] Display {}: screen={:?}, inactive_windows={:?}", display, screen, inactive_windows_on_this_display);
+
+            // Position inactive windows just below this display's bottom edge
+            // This keeps them associated with the correct display/space while hiding them
+            for &wid in &inactive_windows_on_this_display {
+                if self.virtual_workspace_manager.workspace_for_window(display, wid).is_some() {
+                    // Position far below the bottom of this screen
+                    // Use the screen's X coordinate to keep it "on" this display
+                    let offscreen_y = screen.origin.y + screen.size.height + 10000.0;
+                    let offscreen_rect = CGRect::new(
+                        objc2_core_foundation::CGPoint::new(
+                            screen.origin.x,  // Use display's X to keep it associated with this space
+                            offscreen_y,  // Far below bottom edge
+                        ),
+                        CGSize::new(100.0, 100.0),
+                    );
+                    println!("[OFFSCREEN] Display {}: screen.origin.y={}, screen.size.height={}, offscreen_y={}",
+                             display, screen.origin.y, screen.size.height, offscreen_y);
+                    println!("[OFFSCREEN] Display {}: Moving window {:?} to offscreen position {:?}", display, wid, offscreen_rect);
+                    positions.insert(wid, offscreen_rect);
+                    self.positioned_windows_this_cycle.insert(wid, offscreen_rect);
+                    self.offscreen_windows.insert(wid, display);
+                }
+            }
         }
 
         positions.into_iter().collect()
@@ -1300,6 +1405,9 @@ impl LayoutEngine {
                         self.broadcast_workspace_changed(space);
                         self.broadcast_windows_changed(space);
 
+                        // Clear offscreen status for windows in the workspace we're switching to
+                        self.clear_offscreen_for_workspace(display, next_workspace);
+
                         return self.refocus_workspace(space, next_workspace);
                     }
                 }
@@ -1320,6 +1428,9 @@ impl LayoutEngine {
 
                         self.broadcast_workspace_changed(space);
                         self.broadcast_windows_changed(space);
+
+                        // Clear offscreen status for windows in the workspace we're switching to
+                        self.clear_offscreen_for_workspace(display, prev_workspace);
 
                         return self.refocus_workspace(space, prev_workspace);
                     }
@@ -1353,6 +1464,8 @@ impl LayoutEngine {
                                 self.update_active_floating_windows(space);
                                 self.broadcast_workspace_changed(space);
                                 self.broadcast_windows_changed(space);
+                                // Clear offscreen status for windows in the workspace we're switching to
+                                self.clear_offscreen_for_workspace(display, last_workspace);
                                 return self.refocus_workspace(space, last_workspace);
                             }
                         }
@@ -1390,6 +1503,9 @@ impl LayoutEngine {
 
                     self.broadcast_workspace_changed(target_space);
                     self.broadcast_windows_changed(target_space);
+
+                    // Clear offscreen status for windows in the workspace we're switching to
+                    self.clear_offscreen_for_workspace(target_display, workspace_id);
 
                     return self.refocus_workspace(target_space, workspace_id);
                 }
@@ -1547,6 +1663,9 @@ impl LayoutEngine {
 
                     self.broadcast_workspace_changed(space);
                     self.broadcast_windows_changed(space);
+
+                    // Clear offscreen status for windows in the workspace we're switching to
+                    self.clear_offscreen_for_workspace(display, last_workspace);
 
                     return self.refocus_workspace(space, last_workspace);
                 }

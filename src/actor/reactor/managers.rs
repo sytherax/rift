@@ -131,11 +131,15 @@ impl LayoutManager {
         is_resize: bool,
         is_workspace_switch: bool,
     ) -> Result<bool, super::error::ReactorError> {
+        println!("[UPDATE_LAYOUT] Called with is_resize={}, is_workspace_switch={}", is_resize, is_workspace_switch);
         let layout_result = Self::calculate_layout(reactor);
         Self::apply_layout(reactor, layout_result, is_resize, is_workspace_switch)
     }
 
-    fn calculate_layout(reactor: &Reactor) -> LayoutResult {
+    fn calculate_layout(reactor: &mut Reactor) -> LayoutResult {
+        // Clear cycle tracking at the start of each layout calculation
+        reactor.layout_manager.layout_engine.positioned_windows_this_cycle.clear();
+
         let screens = reactor.space_manager.screens.clone();
         // let mut layout_result = Vec::new();
         let mut layout_result = LayoutResult::new();
@@ -179,18 +183,23 @@ impl LayoutManager {
             .or(reactor.drag_manager.drag_swap_manager.dragged());
         let mut any_frame_changed = false;
 
-        for (space, layout) in layout_result {
+        for (space, layout) in &layout_result {
+            println!("[APPLY_LAYOUT] space {:?}: {} windows to position", space, layout.len());
+            for (wid, rect) in layout {
+                println!("[APPLY_LAYOUT] space {:?}: window {:?} -> {:?}", space, wid, rect);
+            }
+
             // Handle stack_line
             if reactor.config_manager.config.settings.ui.stack_line.enabled {
                 if let Some(tx) = &reactor.communication_manager.stack_line_tx {
                     let screen =
-                        reactor.space_manager.screens.iter().find(|s| s.space == Some(space));
+                        reactor.space_manager.screens.iter().find(|s| s.space == Some(*space));
                     if let Some(screen) = screen {
                         let group_infos = reactor
                             .layout_manager
                             .layout_engine
                             .collect_group_containers_in_selection_path(
-                                space,
+                                *space,
                                 screen.frame,
                                 reactor.config_manager.config.settings.ui.stack_line.thickness(),
                                 reactor
@@ -207,7 +216,7 @@ impl LayoutManager {
                             .into_iter()
                             .map(|g| crate::actor::stack_line::GroupInfo {
                                 node_id: g.node_id,
-                                space_id: space,
+                                space_id: *space,
                                 container_kind: g.container_kind,
                                 frame: g.frame,
                                 total_count: g.total_count,
@@ -216,7 +225,7 @@ impl LayoutManager {
                             .collect();
                         if let Err(e) =
                             tx.try_send(crate::actor::stack_line::Event::GroupsUpdated {
-                                space_id: space,
+                                space_id: *space,
                                 groups,
                             })
                         {
@@ -229,12 +238,15 @@ impl LayoutManager {
             let suppress_animation = is_workspace_switch
                 || reactor.workspace_switch_manager.active_workspace_switch.is_some();
             if suppress_animation {
-                any_frame_changed |= AnimationManager::instant_layout(reactor, &layout, skip_wid);
+                any_frame_changed |= AnimationManager::instant_layout(reactor, layout, skip_wid);
             } else {
                 any_frame_changed |=
-                    AnimationManager::animate_layout(reactor, space, &layout, is_resize, skip_wid);
+                    AnimationManager::animate_layout(reactor, *space, layout, is_resize, skip_wid);
             }
         }
+
+        // Windows in inactive workspaces are positioned offscreen by the layout engine
+        // No need for explicit hide/show operations
 
         reactor.maybe_send_menu_update();
         Ok(any_frame_changed)
