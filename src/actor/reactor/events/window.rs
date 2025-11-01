@@ -284,19 +284,22 @@ impl WindowEventHandler {
                         }
                     } else {
                         if let Some(space) = new_space {
-                            if let Some(active_ws) =
-                                reactor.layout_manager.layout_engine.active_workspace(space)
-                            {
-                                let assigned = reactor
-                                    .layout_manager
-                                    .layout_engine
-                                    .virtual_workspace_manager_mut()
-                                    .assign_window_to_workspace(space, wid, active_ws);
-                                if !assigned {
-                                    warn!(
-                                        "Failed to assign window {:?} to workspace {:?}",
-                                        wid, active_ws
-                                    );
+                            // Convert SpaceId to DisplayId
+                            if let Some(display) = reactor.display_for_space(space) {
+                                if let Some(active_ws) =
+                                    reactor.layout_manager.layout_engine.active_workspace(display)
+                                {
+                                    let assigned = reactor
+                                        .layout_manager
+                                        .layout_engine
+                                        .virtual_workspace_manager_mut()
+                                        .assign_window_to_workspace(display, wid, active_ws);
+                                    if !assigned {
+                                        warn!(
+                                            "Failed to assign window {:?} to workspace {:?}",
+                                            wid, active_ws
+                                        );
+                                    }
                                 }
                             }
                             reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));

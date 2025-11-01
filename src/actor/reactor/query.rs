@@ -55,7 +55,8 @@ impl Reactor {
         };
 
         let workspaces = self.handle_workspace_query().workspaces;
-        let active_workspace = self.layout_manager.layout_engine.active_workspace(active_space);
+        let active_workspace = self.display_for_space(active_space)
+            .and_then(|display| self.layout_manager.layout_engine.active_workspace(display));
         let windows = self.handle_windows_query(Some(active_space));
 
         let _ = menu_tx.send(menu_bar::Event::Update {
@@ -71,32 +72,36 @@ impl Reactor {
 
         let space_id = get_active_space_number()
             .or_else(|| self.space_manager.screens.first().and_then(|s| s.space));
+
+        // Convert SpaceId to DisplayId for workspace queries
+        let display_id = space_id.and_then(|space| self.display_for_space(space));
+
         let workspace_list: Vec<(crate::model::VirtualWorkspaceId, String)> =
-            if let Some(space) = space_id {
+            if let Some(display) = display_id {
                 self.layout_manager
                     .layout_engine
                     .virtual_workspace_manager_mut()
-                    .list_workspaces(space)
+                    .list_workspaces(display)
             } else {
                 Vec::new()
             };
 
         for (index, (workspace_id, workspace_name)) in workspace_list.iter().enumerate() {
-            let is_active = if let Some(space) = space_id {
-                self.layout_manager.layout_engine.active_workspace(space) == Some(*workspace_id)
+            let is_active = if let Some(display) = display_id {
+                self.layout_manager.layout_engine.active_workspace(display) == Some(*workspace_id)
             } else {
                 false
             };
 
             let workspace_windows_ids: Vec<crate::actor::app::WindowId> =
-                if let Some(space) = space_id {
+                if let Some(display) = display_id {
                     if is_active {
-                        self.layout_manager.layout_engine.windows_in_active_workspace(space)
+                        self.layout_manager.layout_engine.windows_in_active_workspace(display)
                     } else {
                         self.layout_manager
                             .layout_engine
                             .virtual_workspace_manager()
-                            .workspace_info(space, *workspace_id)
+                            .workspace_info(display, *workspace_id)
                             .map(|ws| ws.windows().collect())
                             .unwrap_or_default()
                     }
@@ -166,13 +171,18 @@ impl Reactor {
             space_id.or_else(|| self.space_manager.screens.first().and_then(|s| s.space));
 
         if let Some(space) = target_space {
-            let active_windows =
-                self.layout_manager.layout_engine.windows_in_active_workspace(space);
+            // Convert SpaceId to DisplayId
+            if let Some(display) = self.display_for_space(space) {
+                let active_windows =
+                    self.layout_manager.layout_engine.windows_in_active_workspace(display);
 
-            active_windows
-                .into_iter()
-                .filter_map(|wid| self.create_window_data(wid))
-                .collect()
+                active_windows
+                    .into_iter()
+                    .filter_map(|wid| self.create_window_data(wid))
+                    .collect()
+            } else {
+                Vec::new()
+            }
         } else {
             self.window_manager
                 .windows
@@ -220,10 +230,12 @@ impl Reactor {
             .find_map(|screen| screen.space.filter(|s| s.get() == space_id_u64))
             .filter(|_space| space_id_u64 > 0)?;
 
-        let _active_workspace = self.layout_manager.layout_engine.active_workspace(space_id)?;
+        // Convert SpaceId to DisplayId
+        let display = self.display_for_space(space_id)?;
+        let _active_workspace = self.layout_manager.layout_engine.active_workspace(display)?;
 
         let active_windows =
-            self.layout_manager.layout_engine.windows_in_active_workspace(space_id);
+            self.layout_manager.layout_engine.windows_in_active_workspace(display);
         let floating_windows: Vec<WindowId> = active_windows
             .iter()
             .filter(|&&wid| self.layout_manager.layout_engine.is_window_floating(wid))
@@ -287,24 +299,25 @@ impl Reactor {
             )>,
         )> = Vec::new();
 
-        for screen in &self.space_manager.screens {
+        for (screen_idx, screen) in self.space_manager.screens.iter().enumerate() {
             if let Some(space) = screen.space {
-                let workspaces = vwm.list_workspaces(space);
-                let active_ws = vwm.active_workspace(space);
+                let display = screen_idx;
+                let workspaces = vwm.list_workspaces(display);
+                let active_ws = vwm.active_workspace(display);
 
                 let mut ws_entries = Vec::new();
                 for (workspace_id, workspace_name) in workspaces {
                     let window_ids: Vec<crate::actor::app::WindowId> =
-                        if let Some(ws) = vwm.workspace_info(space, workspace_id) {
+                        if let Some(ws) = vwm.workspace_info(display, workspace_id) {
                             ws.windows().collect()
                         } else {
                             Vec::new()
                         };
 
-                    let last_focused = vwm.last_focused_window(space, workspace_id);
+                    let last_focused = vwm.last_focused_window(display, workspace_id);
 
                     let floating_positions =
-                        vwm.get_workspace_floating_positions(space, workspace_id);
+                        vwm.get_workspace_floating_positions(display, workspace_id);
 
                     ws_entries.push((
                         workspace_id,
@@ -316,6 +329,7 @@ impl Reactor {
                     ));
                 }
 
+                // Store space.get() for backward compatibility with serialization
                 spaces_intermediate.push((space.get(), ws_entries));
             }
         }
@@ -325,8 +339,11 @@ impl Reactor {
             crate::actor::app::WindowId,
             crate::model::VirtualWorkspaceId,
         )> = Vec::new();
-        for ((space, window_id), workspace_id) in &vwm.window_to_workspace {
-            mapping_intermediate.push((space.get(), *window_id, *workspace_id));
+        for ((display, window_id), workspace_id) in &vwm.window_to_workspace {
+            // Convert display index back to SpaceId for serialization
+            if let Some(space) = self.space_manager.screens.get(*display).and_then(|s| s.space) {
+                mapping_intermediate.push((space.get(), *window_id, *workspace_id));
+            }
         }
 
         let _ = vwm;

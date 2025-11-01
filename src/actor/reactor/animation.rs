@@ -152,7 +152,10 @@ impl AnimationManager {
         is_resize: bool,
         skip_wid: Option<WindowId>,
     ) -> bool {
-        let Some(active_ws) = reactor.layout_manager.layout_engine.active_workspace(space) else {
+        let Some(display) = reactor.display_for_space(space) else {
+            return false;
+        };
+        let Some(active_ws) = reactor.layout_manager.layout_engine.active_workspace(display) else {
             return false;
         };
         let mut anim = Animation::new(
@@ -202,7 +205,7 @@ impl AnimationManager {
                 .layout_manager
                 .layout_engine
                 .virtual_workspace_manager()
-                .workspace_for_window(space, wid)
+                .workspace_for_window(display, wid)
                 .map_or(false, |ws| ws == active_ws);
 
             if is_active {

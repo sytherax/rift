@@ -986,18 +986,20 @@ impl Reactor {
         self.check_for_new_windows();
 
         if let Some(space) = spaces.iter().copied().flatten().next() {
-            if let Some(workspace_id) = self.layout_manager.layout_engine.active_workspace(space) {
-                let workspace_name = self
-                    .layout_manager
-                    .layout_engine
-                    .workspace_name(space, workspace_id)
-                    .unwrap_or_else(|| format!("Workspace {:?}", workspace_id));
-                let broadcast_event = BroadcastEvent::WorkspaceChanged {
-                    workspace_id,
-                    workspace_name,
-                    space_id: space,
-                };
-                _ = self.communication_manager.event_broadcaster.send(broadcast_event);
+            if let Some(display) = self.display_for_space(space) {
+                if let Some(workspace_id) = self.layout_manager.layout_engine.active_workspace(display) {
+                    let workspace_name = self
+                        .layout_manager
+                        .layout_engine
+                        .workspace_name(display, workspace_id)
+                        .unwrap_or_else(|| format!("Workspace {:?}", workspace_id));
+                    let broadcast_event = BroadcastEvent::WorkspaceChanged {
+                        workspace_id,
+                        workspace_name,
+                        space_id: space,
+                    };
+                    _ = self.communication_manager.event_broadcaster.send(broadcast_event);
+                }
             }
         }
     }
@@ -1136,14 +1138,16 @@ impl Reactor {
                 self.send_layout_event(LayoutEvent::WindowRemoved(wid));
             }
             if let Some(space) = final_space {
-                if let Some(active_ws) = self.layout_manager.layout_engine.active_workspace(space) {
-                    let assigned = self
-                        .layout_manager
-                        .layout_engine
-                        .virtual_workspace_manager_mut()
-                        .assign_window_to_workspace(space, wid, active_ws);
-                    if !assigned {
-                        warn!("Failed to assign window {:?} to workspace {:?}", wid, active_ws);
+                if let Some(display) = self.display_for_space(space) {
+                    if let Some(active_ws) = self.layout_manager.layout_engine.active_workspace(display) {
+                        let assigned = self
+                            .layout_manager
+                            .layout_engine
+                            .virtual_workspace_manager_mut()
+                            .assign_window_to_workspace(display, wid, active_ws);
+                        if !assigned {
+                            warn!("Failed to assign window {:?} to workspace {:?}", wid, active_ws);
+                        }
                     }
                 }
                 self.send_layout_event(LayoutEvent::WindowAdded(space, wid));
@@ -1181,12 +1185,12 @@ impl Reactor {
 
     fn expose_all_spaces(&mut self) {
         let screens = self.space_manager.screens.clone();
-        for screen in screens {
+        for (display_idx, screen) in screens.iter().enumerate() {
             let Some(space) = screen.space else { continue };
             self.layout_manager
                 .layout_engine
                 .virtual_workspace_manager_mut()
-                .list_workspaces(space);
+                .list_workspaces(display_idx);
             self.send_layout_event(LayoutEvent::SpaceExposed(space, screen.frame.size));
         }
     }
@@ -1284,23 +1288,25 @@ impl Reactor {
         }
 
         for (space, wids) in windows_by_space {
-            for wid in &wids {
-                let title_opt = self.window_manager.windows.get(wid).map(|w| w.title.clone());
-                if let Err(e) = self
-                    .layout_manager
-                    .layout_engine
-                    .virtual_workspace_manager_mut()
-                    .assign_window_with_app_info(
-                        *wid,
-                        space,
-                        (&app_info.bundle_id).as_deref(),
-                        (&app_info.localized_name).as_deref(),
-                        title_opt.as_deref(),
-                        self.window_manager.windows.get(wid).and_then(|w| w.ax_role.as_deref()),
-                        self.window_manager.windows.get(wid).and_then(|w| w.ax_subrole.as_deref()),
-                    )
-                {
-                    warn!("Failed to assign window {:?} to workspace: {:?}", wid, e);
+            if let Some(display) = self.display_for_space(space) {
+                for wid in &wids {
+                    let title_opt = self.window_manager.windows.get(wid).map(|w| w.title.clone());
+                    if let Err(e) = self
+                        .layout_manager
+                        .layout_engine
+                        .virtual_workspace_manager_mut()
+                        .assign_window_with_app_info(
+                            *wid,
+                            display,
+                            (&app_info.bundle_id).as_deref(),
+                            (&app_info.localized_name).as_deref(),
+                            title_opt.as_deref(),
+                            self.window_manager.windows.get(wid).and_then(|w| w.ax_role.as_deref()),
+                            self.window_manager.windows.get(wid).and_then(|w| w.ax_subrole.as_deref()),
+                        )
+                    {
+                        warn!("Failed to assign window {:?} to workspace: {:?}", wid, e);
+                    }
                 }
             }
 
@@ -1352,16 +1358,18 @@ impl Reactor {
                 }
                 if let Some(space) = self.best_space_for_window(&window_state.frame_monotonic) {
                     if visible_spaces.contains(&space) {
-                        if let Some(active_workspace) =
-                            self.layout_manager.layout_engine.active_workspace(space)
-                        {
-                            if let Some(window_workspace) = self
-                                .layout_manager
-                                .layout_engine
-                                .virtual_workspace_manager()
-                                .workspace_for_window(space, *wid)
+                        if let Some(display) = self.display_for_space(space) {
+                            if let Some(active_workspace) =
+                                self.layout_manager.layout_engine.active_workspace(display)
                             {
-                                return active_workspace == window_workspace;
+                                if let Some(window_workspace) = self
+                                    .layout_manager
+                                    .layout_engine
+                                    .virtual_workspace_manager()
+                                    .workspace_for_window(display, *wid)
+                                {
+                                    return active_workspace == window_workspace;
+                                }
                             }
                         }
                     }
@@ -1418,15 +1426,19 @@ impl Reactor {
             return;
         };
 
+        let Some(window_display) = self.display_for_space(window_space) else {
+            return;
+        };
+
         let workspace_manager = self.layout_manager.layout_engine.virtual_workspace_manager();
         let Some(window_workspace) =
-            workspace_manager.workspace_for_window(window_space, app_window_id)
+            workspace_manager.workspace_for_window(window_display, app_window_id)
         else {
             return;
         };
 
         let Some(current_workspace) =
-            self.layout_manager.layout_engine.active_workspace(window_space)
+            self.layout_manager.layout_engine.active_workspace(window_display)
         else {
             return;
         };
@@ -1453,7 +1465,7 @@ impl Reactor {
                 .layout_manager
                 .layout_engine
                 .virtual_workspace_manager_mut()
-                .list_workspaces(window_space);
+                .list_workspaces(window_display);
             if let Some((workspace_index, _)) =
                 workspaces.iter().enumerate().find(|(_, (ws_id, _))| *ws_id == window_workspace)
             {
@@ -1795,12 +1807,13 @@ impl Reactor {
     }
 
     fn last_focused_window_in_space(&self, space: SpaceId) -> Option<WindowId> {
-        let active_workspace = self.layout_manager.layout_engine.active_workspace(space)?;
+        let display = self.display_for_space(space)?;
+        let active_workspace = self.layout_manager.layout_engine.active_workspace(display)?;
         let wid = self
             .layout_manager
             .layout_engine
             .virtual_workspace_manager()
-            .last_focused_window(space, active_workspace)?;
+            .last_focused_window(display, active_workspace)?;
         let window = self.window_manager.windows.get(&wid)?;
 
         if let Some(actual_space) = self.best_space_for_window(&window.frame_monotonic) {
@@ -1822,7 +1835,10 @@ impl Reactor {
     }
 
     fn request_refocus_if_hidden(&mut self, space: SpaceId, window_id: WindowId) {
-        let Some(active_workspace) = self.layout_manager.layout_engine.active_workspace(space)
+        let Some(display) = self.display_for_space(space) else {
+            return;
+        };
+        let Some(active_workspace) = self.layout_manager.layout_engine.active_workspace(display)
         else {
             return;
         };
@@ -1830,7 +1846,7 @@ impl Reactor {
             .layout_manager
             .layout_engine
             .virtual_workspace_manager()
-            .workspace_for_window(space, window_id)
+            .workspace_for_window(display, window_id)
         else {
             return;
         };
@@ -1846,15 +1862,18 @@ impl Reactor {
                 self.request_refocus_if_hidden(*space, *wid);
             }
             LayoutEvent::WindowsOnScreenUpdated(space, _, windows, _) => {
+                let Some(display) = self.display_for_space(*space) else {
+                    return;
+                };
                 let Some(active_workspace) =
-                    self.layout_manager.layout_engine.active_workspace(*space)
+                    self.layout_manager.layout_engine.active_workspace(display)
                 else {
                     return;
                 };
                 let manager = self.layout_manager.layout_engine.virtual_workspace_manager();
                 let hidden_exists = windows.iter().any(|(wid, _, _, _)| {
                     manager
-                        .workspace_for_window(*space, *wid)
+                        .workspace_for_window(display, *wid)
                         .map_or(false, |workspace_id| workspace_id != active_workspace)
                 });
                 if hidden_exists {
@@ -1950,10 +1969,13 @@ impl Reactor {
     }
 
     fn store_current_floating_positions(&mut self, space: SpaceId) {
+        let Some(display) = self.display_for_space(space) else {
+            return;
+        };
         let floating_windows_in_workspace = self
             .layout_manager
             .layout_engine
-            .windows_in_active_workspace(space)
+            .windows_in_active_workspace(display)
             .into_iter()
             .filter(|&wid| self.layout_manager.layout_engine.is_window_floating(wid))
             .filter_map(|wid| {
@@ -1978,5 +2000,58 @@ impl Reactor {
         is_workspace_switch: bool,
     ) -> Result<bool, error::ReactorError> {
         LayoutManager::update_layout(self, is_resize, is_workspace_switch)
+    }
+
+    // ========== Display/Space Mapping Helpers ==========
+
+    /// Get the DisplayId (screen index) for a given SpaceId
+    /// Returns the index of the screen that has this space
+    fn display_for_space(&self, space: SpaceId) -> Option<usize> {
+        self.space_manager
+            .screens
+            .iter()
+            .position(|screen| screen.space == Some(space))
+    }
+
+    /// Get the SpaceId for a given DisplayId (screen index)
+    fn space_for_display(&self, display: usize) -> Option<SpaceId> {
+        self.space_manager.screens.get(display).and_then(|screen| screen.space)
+    }
+
+    /// Get the DisplayId for a window based on its frame/position
+    /// Finds which screen contains the center of the window
+    fn display_for_window_frame(&self, frame: &CGRect) -> Option<usize> {
+        let center = CGPoint::new(
+            frame.origin.x + frame.size.width / 2.0,
+            frame.origin.y + frame.size.height / 2.0
+        );
+
+        self.space_manager
+            .screens
+            .iter()
+            .enumerate()
+            .find(|(_, screen)| {
+                center.x >= screen.frame.origin.x
+                    && center.x < screen.frame.origin.x + screen.frame.size.width
+                    && center.y >= screen.frame.origin.y
+                    && center.y < screen.frame.origin.y + screen.frame.size.height
+            })
+            .map(|(idx, _)| idx)
+            .or_else(|| {
+                // Fallback: use first screen
+                if !self.space_manager.screens.is_empty() {
+                    Some(0)
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Get the DisplayId for a window
+    fn display_for_window(&self, window_id: WindowId) -> Option<usize> {
+        self.window_manager
+            .windows
+            .get(&window_id)
+            .and_then(|window_state| self.display_for_window_frame(&window_state.frame_monotonic))
     }
 }

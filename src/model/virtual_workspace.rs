@@ -14,6 +14,11 @@ use crate::sys::app::pid_t;
 use crate::sys::geometry::CGRectDef;
 use crate::sys::screen::SpaceId;
 
+/// DisplayId represents a physical display/monitor index (0, 1, 2, ...)
+/// In multi-monitor setups, each display can have independent workspaces
+/// The index corresponds to the position in the screens Vec in the reactor
+pub type DisplayId = usize;
+
 new_key_type! {
     pub struct VirtualWorkspaceId;
 }
@@ -42,16 +47,19 @@ pub enum WorkspaceError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtualWorkspace {
     pub name: String,
-    pub space: SpaceId,
+    pub display: DisplayId,
+    #[serde(skip)]
+    pub space: Option<SpaceId>, // Optional: tracks the native macOS Space for this display
     windows: HashSet<WindowId>,
     last_focused: Option<WindowId>,
 }
 
 impl VirtualWorkspace {
-    fn new(name: String, space: SpaceId) -> Self {
+    fn new(name: String, display: DisplayId) -> Self {
         Self {
             name,
-            space,
+            display,
+            space: None,
             windows: HashSet::default(),
             last_focused: None,
         }
@@ -92,13 +100,15 @@ impl Default for HideCorner {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VirtualWorkspaceManager {
     workspaces: SlotMap<VirtualWorkspaceId, VirtualWorkspace>,
-    workspaces_by_space: HashMap<SpaceId, Vec<VirtualWorkspaceId>>,
-    pub active_workspace_per_space:
-        HashMap<SpaceId, (Option<VirtualWorkspaceId>, VirtualWorkspaceId)>,
-    pub window_to_workspace: HashMap<(SpaceId, WindowId), VirtualWorkspaceId>,
+    workspaces_by_display: HashMap<DisplayId, Vec<VirtualWorkspaceId>>,
+    pub active_workspace_per_display:
+        HashMap<DisplayId, (Option<VirtualWorkspaceId>, VirtualWorkspaceId)>,
+    pub window_to_workspace: HashMap<(DisplayId, WindowId), VirtualWorkspaceId>,
     #[serde(skip)]
-    window_rule_floating: HashMap<(SpaceId, WindowId), bool>,
-    floating_positions: HashMap<(SpaceId, VirtualWorkspaceId), FloatingWindowPositions>,
+    display_to_space: HashMap<DisplayId, SpaceId>, // Track native macOS Space per display
+    #[serde(skip)]
+    window_rule_floating: HashMap<(DisplayId, WindowId), bool>,
+    floating_positions: HashMap<(DisplayId, VirtualWorkspaceId), FloatingWindowPositions>,
     workspace_counter: usize,
     #[serde(skip)]
     app_rules: Vec<AppWorkspaceRule>,
@@ -128,9 +138,10 @@ impl VirtualWorkspaceManager {
     pub fn new_with_config(config: &VirtualWorkspaceSettings) -> Self {
         Self {
             workspaces: SlotMap::default(),
-            workspaces_by_space: HashMap::default(),
-            active_workspace_per_space: HashMap::default(),
+            workspaces_by_display: HashMap::default(),
+            active_workspace_per_display: HashMap::default(),
             window_to_workspace: HashMap::default(),
+            display_to_space: HashMap::default(),
             window_rule_floating: HashMap::default(),
             floating_positions: HashMap::default(),
             workspace_counter: 1,
@@ -142,8 +153,8 @@ impl VirtualWorkspaceManager {
         }
     }
 
-    fn ensure_space_initialized(&mut self, space: SpaceId) {
-        if self.workspaces_by_space.contains_key(&space) {
+    fn ensure_display_initialized(&mut self, display: DisplayId) {
+        if self.workspaces_by_display.contains_key(&display) {
             return;
         }
 
@@ -155,28 +166,55 @@ impl VirtualWorkspaceManager {
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| format!("Workspace {}", i + 1));
-            let ws = VirtualWorkspace::new(name, space);
+            let ws = VirtualWorkspace::new(name, display);
             let id = self.workspaces.insert(ws);
             ids.push(id);
         }
-        self.workspaces_by_space.insert(space, ids.clone());
+        self.workspaces_by_display.insert(display, ids.clone());
 
         if let Some(&first_id) = ids.first() {
-            self.active_workspace_per_space.insert(space, (None, first_id));
+            self.active_workspace_per_display.insert(display, (None, first_id));
         }
+    }
+
+    /// Update the mapping between display and its native macOS Space
+    pub fn update_display_space_mapping(&mut self, display: DisplayId, space: SpaceId) {
+        self.display_to_space.insert(display, space);
+
+        // Update all workspaces for this display with the current space
+        if let Some(workspace_ids) = self.workspaces_by_display.get(&display) {
+            for &workspace_id in workspace_ids {
+                if let Some(workspace) = self.workspaces.get_mut(workspace_id) {
+                    workspace.space = Some(space);
+                }
+            }
+        }
+    }
+
+    /// Get the native macOS Space for a display
+    pub fn get_space_for_display(&self, display: DisplayId) -> Option<SpaceId> {
+        self.display_to_space.get(&display).copied()
+    }
+
+    /// Get the display index for a given SpaceId
+    pub fn get_display_for_space(&self, space: SpaceId) -> Option<DisplayId> {
+        self.display_to_space
+            .iter()
+            .find(|(_, s)| **s == space)
+            .map(|(display, _)| *display)
     }
 
     pub fn create_workspace(
         &mut self,
-        space: SpaceId,
+        display: DisplayId,
         name: Option<String>,
     ) -> Result<VirtualWorkspaceId, WorkspaceError> {
-        self.ensure_space_initialized(space);
-        let count = self.workspaces_by_space.get(&space).map(|v| v.len()).unwrap_or(0);
+        self.ensure_display_initialized(display);
+        let count = self.workspaces_by_display.get(&display).map(|v| v.len()).unwrap_or(0);
         if count >= self.max_workspaces {
             return Err(WorkspaceError::InconsistentState(format!(
-                "Maximum workspace limit ({}) reached for space {:?}",
-                self.max_workspaces, space
+                "Maximum workspace limit ({}) reached for display {:?}",
+                self.max_workspaces, display
             )));
         }
 
@@ -186,40 +224,45 @@ impl VirtualWorkspaceManager {
             name
         });
 
-        let workspace = VirtualWorkspace::new(name, space);
+        let mut workspace = VirtualWorkspace::new(name, display);
+        // Set the space if we know it
+        if let Some(space) = self.display_to_space.get(&display) {
+            workspace.space = Some(*space);
+        }
         let workspace_id = self.workspaces.insert(workspace);
-        self.workspaces_by_space.entry(space).or_default().push(workspace_id);
+        self.workspaces_by_display.entry(display).or_default().push(workspace_id);
 
         Ok(workspace_id)
     }
 
-    pub fn last_workspace(&self, space: SpaceId) -> Option<VirtualWorkspaceId> {
-        self.active_workspace_per_space.get(&space)?.0
+    pub fn last_workspace(&self, display: DisplayId) -> Option<VirtualWorkspaceId> {
+        self.active_workspace_per_display.get(&display)?.0
     }
 
-    pub fn active_workspace(&self, space: SpaceId) -> Option<VirtualWorkspaceId> {
-        self.active_workspace_per_space.get(&space).map(|tuple| tuple.1)
+    pub fn active_workspace(&self, display: DisplayId) -> Option<VirtualWorkspaceId> {
+        self.active_workspace_per_display.get(&display).map(|tuple| tuple.1)
     }
 
     pub fn workspace_auto_back_and_forth(&self) -> bool { self.workspace_auto_back_and_forth }
 
     pub fn set_active_workspace(
         &mut self,
-        space: SpaceId,
+        display: DisplayId,
         workspace_id: VirtualWorkspaceId,
     ) -> bool {
         trace_misc("set_active_workspace", || {
-            let active = self.active_workspace_per_space.get(&space).map(|tuple| tuple.1);
+            let active = self.active_workspace_per_display.get(&display).map(|tuple| tuple.1);
 
             let result = if self.workspaces.contains_key(workspace_id)
-                && self.workspaces.get(workspace_id).map(|w| w.space) == Some(space)
+                && self.workspaces.get(workspace_id).map(|w| w.display) == Some(display)
             {
-                self.active_workspace_per_space.insert(space, (active, workspace_id));
+                self.active_workspace_per_display.insert(display, (active, workspace_id));
                 true
             } else {
+                let display_id = display;
                 error!(
-                    "Attempted to set non-existent or foreign workspace {:?} as active for {:?}",
-                    workspace_id, space
+                    "Attempted to set non-existent or foreign workspace {:?} as active for display {}",
+                    workspace_id, display_id
                 );
                 false
             };
@@ -230,10 +273,10 @@ impl VirtualWorkspaceManager {
 
     fn filtered_workspace_ids(
         &self,
-        space: SpaceId,
+        display: DisplayId,
         skip_empty: Option<bool>,
     ) -> Vec<VirtualWorkspaceId> {
-        let ids = match self.workspaces_by_space.get(&space) {
+        let ids = match self.workspaces_by_display.get(&display) {
             Some(v) => v,
             None => return Vec::new(),
         };
@@ -254,15 +297,15 @@ impl VirtualWorkspaceManager {
 
     fn step_workspace(
         &self,
-        space: SpaceId,
+        display: DisplayId,
         current: VirtualWorkspaceId,
         skip_empty: Option<bool>,
         dir: Direction,
     ) -> Option<VirtualWorkspaceId> {
         let base_ids: Vec<VirtualWorkspaceId> = if skip_empty == Some(true) {
-            self.filtered_workspace_ids(space, Some(true))
+            self.filtered_workspace_ids(display, Some(true))
         } else {
-            self.workspaces_by_space.get(&space).cloned().unwrap_or_default()
+            self.workspaces_by_display.get(&display).cloned().unwrap_or_default()
         };
 
         if base_ids.is_empty() {
@@ -274,7 +317,7 @@ impl VirtualWorkspaceManager {
             return Some(base_ids[i]);
         }
 
-        let fallback_ids = self.filtered_workspace_ids(space, Some(false));
+        let fallback_ids = self.filtered_workspace_ids(display, Some(false));
         if fallback_ids.is_empty() {
             return None;
         }
@@ -298,67 +341,68 @@ impl VirtualWorkspaceManager {
 
     pub fn next_workspace(
         &self,
-        space: SpaceId,
+        display: DisplayId,
         current: VirtualWorkspaceId,
         skip_empty: Option<bool>,
     ) -> Option<VirtualWorkspaceId> {
-        self.step_workspace(space, current, skip_empty, Direction::Right)
+        self.step_workspace(display, current, skip_empty, Direction::Right)
     }
 
     pub fn prev_workspace(
         &self,
-        space: SpaceId,
+        display: DisplayId,
         current: VirtualWorkspaceId,
         skip_empty: Option<bool>,
     ) -> Option<VirtualWorkspaceId> {
-        self.step_workspace(space, current, skip_empty, Direction::Left)
+        self.step_workspace(display, current, skip_empty, Direction::Left)
     }
 
     pub fn assign_window_to_workspace(
         &mut self,
-        space: SpaceId,
+        display: DisplayId,
         window_id: WindowId,
         workspace_id: VirtualWorkspaceId,
     ) -> bool {
         trace_misc("assign_window_to_workspace", || {
             if !self.workspaces.contains_key(workspace_id)
-                || self.workspaces.get(workspace_id).map(|w| w.space) != Some(space)
+                || self.workspaces.get(workspace_id).map(|w| w.display) != Some(display)
             {
+                let display_id = display;
                 error!(
-                    "Attempted to assign window to non-existent/foreign workspace {:?} for space {:?}",
-                    workspace_id, space
+                    "Attempted to assign window to non-existent/foreign workspace {:?} for display {}",
+                    workspace_id, display_id
                 );
                 return false;
             }
 
-            let existing_mapping: Option<(SpaceId, VirtualWorkspaceId)> =
-                self.window_to_workspace.iter().find_map(|(&(existing_space, wid), &ws_id)| {
+            let existing_mapping: Option<(DisplayId, VirtualWorkspaceId)> =
+                self.window_to_workspace.iter().find_map(|(&(existing_display, wid), &ws_id)| {
                     if wid == window_id {
-                        Some((existing_space, ws_id))
+                        Some((existing_display, ws_id))
                     } else {
                         None
                     }
                 });
 
-            if let Some((existing_space, old_workspace_id)) = existing_mapping {
-                if existing_space != space {
+            if let Some((existing_display, old_workspace_id)) = existing_mapping {
+                if existing_display != display {
                     if let Some(old_workspace) = self.workspaces.get_mut(old_workspace_id) {
                         old_workspace.remove_window(window_id);
                     }
-                    self.window_to_workspace.remove(&(existing_space, window_id));
-                    self.window_rule_floating.remove(&(existing_space, window_id));
+                    self.window_to_workspace.remove(&(existing_display, window_id));
+                    self.window_rule_floating.remove(&(existing_display, window_id));
                 } else {
                     if let Some(old_workspace) = self.workspaces.get_mut(old_workspace_id) {
                         old_workspace.remove_window(window_id);
                     }
-                    self.window_to_workspace.remove(&(existing_space, window_id));
-                    self.window_rule_floating.remove(&(existing_space, window_id));
+                    self.window_to_workspace.remove(&(existing_display, window_id));
+                    self.window_rule_floating.remove(&(existing_display, window_id));
                 }
             }
 
             if let Some(workspace) = self.workspaces.get_mut(workspace_id) {
                 workspace.add_window(window_id);
-                self.window_to_workspace.insert((space, window_id), workspace_id);
+                self.window_to_workspace.insert((display, window_id), workspace_id);
                 true
             } else {
                 error!(
@@ -372,25 +416,25 @@ impl VirtualWorkspaceManager {
 
     pub fn workspace_for_window(
         &self,
-        space: SpaceId,
+        display: DisplayId,
         window_id: WindowId,
     ) -> Option<VirtualWorkspaceId> {
-        self.window_to_workspace.get(&(space, window_id)).copied()
+        self.window_to_workspace.get(&(display, window_id)).copied()
     }
 
     pub fn remove_window(&mut self, window_id: WindowId) {
-        let keys: Vec<(SpaceId, WindowId)> = self
+        let keys: Vec<(DisplayId, WindowId)> = self
             .window_to_workspace
             .keys()
             .copied()
             .filter(|(_, wid)| *wid == window_id)
             .collect();
-        for (space, wid) in keys {
-            if let Some(workspace_id) = self.window_to_workspace.remove(&(space, wid)) {
+        for (display, wid) in keys {
+            if let Some(workspace_id) = self.window_to_workspace.remove(&(display, wid)) {
                 if let Some(workspace) = self.workspaces.get_mut(workspace_id) {
                     workspace.remove_window(wid);
                 }
-                self.window_rule_floating.remove(&(space, wid));
+                self.window_rule_floating.remove(&(display, wid));
             }
         }
     }
@@ -399,28 +443,28 @@ impl VirtualWorkspaceManager {
         let windows_to_remove: Vec<_> = self
             .window_to_workspace
             .keys()
-            .filter_map(|(space, wid)| {
+            .filter_map(|(display, wid)| {
                 if wid.pid == pid {
-                    Some((*space, *wid))
+                    Some((*display, *wid))
                 } else {
                     None
                 }
             })
             .collect();
 
-        for (space, window_id) in windows_to_remove {
-            if let Some(ws_id) = self.window_to_workspace.remove(&(space, window_id)) {
+        for (display, window_id) in windows_to_remove {
+            if let Some(ws_id) = self.window_to_workspace.remove(&(display, window_id)) {
                 if let Some(workspace) = self.workspaces.get_mut(ws_id) {
                     workspace.remove_window(window_id);
                 }
-                self.window_rule_floating.remove(&(space, window_id));
+                self.window_rule_floating.remove(&(display, window_id));
             }
         }
     }
 
-    /// Gets all windows in the active virtual workspace for a given native space.
-    pub fn windows_in_active_workspace(&self, space: SpaceId) -> Vec<WindowId> {
-        if let Some(workspace_id) = self.active_workspace(space) {
+    /// Gets all windows in the active virtual workspace for a given display
+    pub fn windows_in_active_workspace(&self, display: DisplayId) -> Vec<WindowId> {
+        if let Some(workspace_id) = self.active_workspace(display) {
             if let Some(workspace) = self.workspaces.get(workspace_id) {
                 return workspace.windows().collect();
             }
@@ -428,12 +472,12 @@ impl VirtualWorkspaceManager {
         Vec::new()
     }
 
-    pub fn windows_in_inactive_workspaces(&self, space: SpaceId) -> Vec<WindowId> {
-        let active_workspace_id = self.active_workspace(space);
+    pub fn windows_in_inactive_workspaces(&self, display: DisplayId) -> Vec<WindowId> {
+        let active_workspace_id = self.active_workspace(display);
 
         self.workspaces
             .iter()
-            .filter(|(id, workspace)| workspace.space == space && Some(*id) != active_workspace_id)
+            .filter(|(id, workspace)| workspace.display == display && Some(*id) != active_workspace_id)
             .flat_map(|(_, workspace)| workspace.windows())
             .collect()
     }
@@ -483,11 +527,11 @@ impl VirtualWorkspaceManager {
 
     pub fn set_last_focused_window(
         &mut self,
-        space: SpaceId,
+        display: DisplayId,
         workspace_id: VirtualWorkspaceId,
         window_id: Option<WindowId>,
     ) {
-        if self.workspaces.get(workspace_id).map(|w| w.space) == Some(space) {
+        if self.workspaces.get(workspace_id).map(|w| w.display) == Some(display) {
             if let Some(workspace) = self.workspaces.get_mut(workspace_id) {
                 workspace.set_last_focused(window_id);
             }
@@ -496,10 +540,10 @@ impl VirtualWorkspaceManager {
 
     pub fn last_focused_window(
         &self,
-        space: SpaceId,
+        display: DisplayId,
         workspace_id: VirtualWorkspaceId,
     ) -> Option<WindowId> {
-        if self.workspaces.get(workspace_id).map(|w| w.space) == Some(space) {
+        if self.workspaces.get(workspace_id).map(|w| w.display) == Some(display) {
             self.workspaces.get(workspace_id)?.last_focused()
         } else {
             None
@@ -508,10 +552,10 @@ impl VirtualWorkspaceManager {
 
     pub fn workspace_info(
         &self,
-        space: SpaceId,
+        display: DisplayId,
         workspace_id: VirtualWorkspaceId,
     ) -> Option<&VirtualWorkspace> {
-        if self.workspaces.get(workspace_id).map(|w| w.space) == Some(space) {
+        if self.workspaces.get(workspace_id).map(|w| w.display) == Some(display) {
             self.workspaces.get(workspace_id)
         } else {
             None
@@ -520,12 +564,12 @@ impl VirtualWorkspaceManager {
 
     pub fn store_floating_position(
         &mut self,
-        space: SpaceId,
+        display: DisplayId,
         window_id: WindowId,
         position: CGRect,
     ) {
-        if let Some(workspace_id) = self.active_workspace(space) {
-            let key = (space, workspace_id);
+        if let Some(workspace_id) = self.active_workspace(display) {
+            let key = (display, workspace_id);
             self.floating_positions
                 .entry(key)
                 .or_default()
@@ -535,21 +579,21 @@ impl VirtualWorkspaceManager {
 
     pub fn get_floating_position(
         &self,
-        space: SpaceId,
+        display: DisplayId,
         workspace_id: VirtualWorkspaceId,
         window_id: WindowId,
     ) -> Option<CGRect> {
-        let key = (space, workspace_id);
+        let key = (display, workspace_id);
         self.floating_positions.get(&key)?.get_position(window_id)
     }
 
     pub fn store_current_floating_positions(
         &mut self,
-        space: SpaceId,
+        display: DisplayId,
         floating_windows: &[(WindowId, CGRect)],
     ) {
-        if let Some(workspace_id) = self.active_workspace(space) {
-            let key = (space, workspace_id);
+        if let Some(workspace_id) = self.active_workspace(display) {
+            let key = (display, workspace_id);
             let positions = self.floating_positions.entry(key).or_default();
 
             for &(window_id, position) in floating_windows {
@@ -560,10 +604,10 @@ impl VirtualWorkspaceManager {
 
     pub fn get_workspace_floating_positions(
         &self,
-        space: SpaceId,
+        display: DisplayId,
         workspace_id: VirtualWorkspaceId,
     ) -> Vec<(WindowId, CGRect)> {
-        let key = (space, workspace_id);
+        let key = (display, workspace_id);
         if let Some(positions) = self.floating_positions.get(&key) {
             positions
                 .windows()
@@ -588,9 +632,9 @@ impl VirtualWorkspaceManager {
         }
     }
 
-    pub fn list_workspaces(&mut self, space: SpaceId) -> Vec<(VirtualWorkspaceId, String)> {
-        self.ensure_space_initialized(space);
-        let ids = self.workspaces_by_space.get(&space).cloned().unwrap_or_default();
+    pub fn list_workspaces(&mut self, display: DisplayId) -> Vec<(VirtualWorkspaceId, String)> {
+        self.ensure_display_initialized(display);
+        let ids = self.workspaces_by_display.get(&display).cloned().unwrap_or_default();
         let workspaces: Vec<_> = ids
             .into_iter()
             .filter_map(|id| self.workspaces.get(id).map(|ws| (id, ws.name.clone())))
@@ -601,11 +645,11 @@ impl VirtualWorkspaceManager {
 
     pub fn rename_workspace(
         &mut self,
-        space: SpaceId,
+        display: DisplayId,
         workspace_id: VirtualWorkspaceId,
         new_name: String,
     ) -> bool {
-        if self.workspaces.get(workspace_id).map(|w| w.space) != Some(space) {
+        if self.workspaces.get(workspace_id).map(|w| w.display) != Some(display) {
             return false;
         }
         if let Some(workspace) = self.workspaces.get_mut(workspace_id) {
@@ -620,11 +664,11 @@ impl VirtualWorkspaceManager {
     pub fn auto_assign_window(
         &mut self,
         window_id: WindowId,
-        space: SpaceId,
+        display: DisplayId,
     ) -> Result<VirtualWorkspaceId, WorkspaceError> {
-        let default_workspace_id = self.get_default_workspace(space)?;
-        if self.assign_window_to_workspace(space, window_id, default_workspace_id) {
-            self.window_rule_floating.remove(&(space, window_id));
+        let default_workspace_id = self.get_default_workspace(display)?;
+        if self.assign_window_to_workspace(display, window_id, default_workspace_id) {
+            self.window_rule_floating.remove(&(display, window_id));
             Ok(default_workspace_id)
         } else {
             Err(WorkspaceError::AssignmentFailed)
@@ -634,21 +678,21 @@ impl VirtualWorkspaceManager {
     pub fn assign_window_with_app_info(
         &mut self,
         window_id: WindowId,
-        space: SpaceId,
+        display: DisplayId,
         app_bundle_id: Option<&str>,
         app_name: Option<&str>,
         window_title: Option<&str>,
         ax_role: Option<&str>,
         ax_subrole: Option<&str>,
     ) -> Result<(VirtualWorkspaceId, bool), WorkspaceError> {
-        self.ensure_space_initialized(space);
-        if self.workspaces_by_space.get(&space).map(|v| v.is_empty()).unwrap_or(true) {
+        self.ensure_display_initialized(display);
+        if self.workspaces_by_display.get(&display).map(|v| v.is_empty()).unwrap_or(true) {
             return Err(WorkspaceError::NoWorkspacesAvailable);
         }
 
-        if let Some(existing_ws) = self.window_to_workspace.get(&(space, window_id)).copied() {
+        if let Some(existing_ws) = self.window_to_workspace.get(&(display, window_id)).copied() {
             let should_float =
-                self.window_rule_floating.get(&(space, window_id)).copied().unwrap_or(false);
+                self.window_rule_floating.get(&(display, window_id)).copied().unwrap_or(false);
             return Ok((existing_ws, should_float));
         }
 
@@ -661,14 +705,15 @@ impl VirtualWorkspaceManager {
                 let maybe_idx: Option<usize> = match ws_sel {
                     WorkspaceSelector::Index(i) => Some(*i),
                     WorkspaceSelector::Name(name) => {
-                        let workspaces = self.list_workspaces(space);
+                        let workspaces = self.list_workspaces(display);
                         match workspaces.iter().position(|(_, n)| n == name) {
                             Some(idx) => Some(idx),
                             None => {
+                                let display_id = display;
                                 tracing::warn!(
-                                    "App rule references workspace name '{}' which could not be resolved for space {:?}; falling back to default workspace",
+                                    "App rule references workspace name '{}' which could not be resolved for display {}; falling back to default workspace",
                                     name,
-                                    space
+                                    display_id
                                 );
                                 None
                             }
@@ -677,15 +722,15 @@ impl VirtualWorkspaceManager {
                 };
 
                 if let Some(workspace_idx) = maybe_idx {
-                    let len = self.workspaces_by_space.get(&space).map(|v| v.len()).unwrap_or(0);
+                    let len = self.workspaces_by_display.get(&display).map(|v| v.len()).unwrap_or(0);
                     if workspace_idx >= len {
                         tracing::warn!(
                             "App rule references non-existent workspace index {}, falling back to active workspace",
                             workspace_idx
                         );
-                        self.get_default_workspace(space)?
+                        self.get_default_workspace(display)?
                     } else {
-                        let workspaces = self.list_workspaces(space);
+                        let workspaces = self.list_workspaces(display);
                         if let Some((workspace_id, _)) = workspaces.get(workspace_idx) {
                             *workspace_id
                         } else {
@@ -693,21 +738,21 @@ impl VirtualWorkspaceManager {
                                 "App rule references invalid workspace index {}, falling back to active workspace",
                                 workspace_idx
                             );
-                            self.get_default_workspace(space)?
+                            self.get_default_workspace(display)?
                         }
                     }
                 } else {
-                    self.get_default_workspace(space)?
+                    self.get_default_workspace(display)?
                 }
             } else {
-                self.get_default_workspace(space)?
+                self.get_default_workspace(display)?
             };
 
-            if self.assign_window_to_workspace(space, window_id, target_workspace_id) {
+            if self.assign_window_to_workspace(display, window_id, target_workspace_id) {
                 if rule.floating {
-                    self.window_rule_floating.insert((space, window_id), true);
+                    self.window_rule_floating.insert((display, window_id), true);
                 } else {
-                    self.window_rule_floating.remove(&(space, window_id));
+                    self.window_rule_floating.remove(&(display, window_id));
                 }
                 return Ok((target_workspace_id, rule.floating));
             } else {
@@ -715,9 +760,9 @@ impl VirtualWorkspaceManager {
             }
         }
 
-        let default_workspace_id = self.get_default_workspace(space)?;
-        if self.assign_window_to_workspace(space, window_id, default_workspace_id) {
-            self.window_rule_floating.remove(&(space, window_id));
+        let default_workspace_id = self.get_default_workspace(display)?;
+        if self.assign_window_to_workspace(display, window_id, default_workspace_id) {
+            self.window_rule_floating.remove(&(display, window_id));
             Ok((default_workspace_id, false))
         } else {
             error!("Failed to assign window to default workspace");
@@ -727,27 +772,27 @@ impl VirtualWorkspaceManager {
 
     fn get_default_workspace(
         &mut self,
-        space: SpaceId,
+        display: DisplayId,
     ) -> Result<VirtualWorkspaceId, WorkspaceError> {
-        self.ensure_space_initialized(space);
-        if let Some(active_workspace_id) = self.active_workspace(space) {
+        self.ensure_display_initialized(display);
+        if let Some(active_workspace_id) = self.active_workspace(display) {
             if self.workspaces.contains_key(active_workspace_id) {
                 return Ok(active_workspace_id);
             } else {
                 warn!("Active workspace no longer exists, clearing reference");
-                self.active_workspace_per_space.remove(&space);
+                self.active_workspace_per_display.remove(&display);
             }
         }
 
         let first_id = self
-            .workspaces_by_space
-            .get(&space)
+            .workspaces_by_display
+            .get(&display)
             .and_then(|v| v.first().copied())
             .ok_or_else(|| {
-                WorkspaceError::InconsistentState("No workspaces for space".to_string())
+                WorkspaceError::InconsistentState("No workspaces for display".to_string())
             })?;
 
-        if self.set_active_workspace(space, first_id) {
+        if self.set_active_workspace(display, first_id) {
             Ok(first_id)
         } else {
             Err(WorkspaceError::InconsistentState(
@@ -928,7 +973,7 @@ impl VirtualWorkspaceManager {
         let mut stats = WorkspaceStats {
             total_workspaces: self.workspaces.len(),
             total_windows: self.window_to_workspace.len(),
-            active_spaces: self.active_workspace_per_space.len(),
+            active_spaces: self.active_workspace_per_display.len(),
             workspace_window_counts: HashMap::default(),
         };
 
@@ -985,48 +1030,47 @@ pub struct WorkspaceStats {
 mod tests {
     use super::*;
     use crate::actor::app::WindowId;
-    use crate::sys::screen::SpaceId;
 
     #[test]
     fn test_virtual_workspace_creation() {
         let mut manager = VirtualWorkspaceManager::new();
 
-        let space = SpaceId::new(1);
+        let display = 0usize;
         assert_eq!(
-            manager.list_workspaces(space).len(),
-            manager.workspaces_by_space.get(&space).map(|v| v.len()).unwrap_or(0)
+            manager.list_workspaces(display).len(),
+            manager.workspaces_by_display.get(&display).map(|v| v.len()).unwrap_or(0)
         );
 
-        let ws_id = manager.create_workspace(space, Some("Test Workspace".to_string())).unwrap();
+        let ws_id = manager.create_workspace(display, Some("Test Workspace".to_string())).unwrap();
         assert!(
             manager
-                .list_workspaces(space)
+                .list_workspaces(display)
                 .iter()
                 .any(|(id, name)| *id == ws_id && name == "Test Workspace")
         );
 
-        let workspace = manager.workspace_info(space, ws_id).unwrap();
+        let workspace = manager.workspace_info(display, ws_id).unwrap();
         assert_eq!(workspace.name, "Test Workspace");
     }
 
     #[test]
     fn test_window_assignment() {
         let mut manager = VirtualWorkspaceManager::new();
-        let space = SpaceId::new(1);
-        let ws1_id = manager.create_workspace(space, Some("WS1".to_string())).unwrap();
-        let ws2_id = manager.create_workspace(space, Some("WS2".to_string())).unwrap();
+        let display = 0usize;
+        let ws1_id = manager.create_workspace(display, Some("WS1".to_string())).unwrap();
+        let ws2_id = manager.create_workspace(display, Some("WS2".to_string())).unwrap();
 
         let window1 = WindowId::new(1, 1);
         let window2 = WindowId::new(1, 2);
 
-        assert!(manager.assign_window_to_workspace(space, window1, ws1_id));
-        assert!(manager.assign_window_to_workspace(space, window2, ws2_id));
+        assert!(manager.assign_window_to_workspace(display, window1, ws1_id));
+        assert!(manager.assign_window_to_workspace(display, window2, ws2_id));
 
-        assert_eq!(manager.workspace_for_window(space, window1), Some(ws1_id));
-        assert_eq!(manager.workspace_for_window(space, window2), Some(ws2_id));
+        assert_eq!(manager.workspace_for_window(display, window1), Some(ws1_id));
+        assert_eq!(manager.workspace_for_window(display, window2), Some(ws2_id));
 
-        let ws1 = manager.workspace_info(space, ws1_id).unwrap();
-        let ws2 = manager.workspace_info(space, ws2_id).unwrap();
+        let ws1 = manager.workspace_info(display, ws1_id).unwrap();
+        let ws2 = manager.workspace_info(display, ws2_id).unwrap();
 
         assert!(ws1.contains_window(window1));
         assert!(!ws1.contains_window(window2));
@@ -1037,15 +1081,15 @@ mod tests {
     #[test]
     fn test_active_workspace_switching() {
         let mut manager = VirtualWorkspaceManager::new();
-        let space = SpaceId::new(1);
-        let ws1_id = manager.create_workspace(space, Some("WS1".to_string())).unwrap();
-        let ws2_id = manager.create_workspace(space, Some("WS2".to_string())).unwrap();
+        let display = 0usize;
+        let ws1_id = manager.create_workspace(display, Some("WS1".to_string())).unwrap();
+        let ws2_id = manager.create_workspace(display, Some("WS2".to_string())).unwrap();
 
-        assert!(manager.set_active_workspace(space, ws1_id));
-        assert_eq!(manager.active_workspace(space), Some(ws1_id));
+        assert!(manager.set_active_workspace(display, ws1_id));
+        assert_eq!(manager.active_workspace(display), Some(ws1_id));
 
-        assert!(manager.set_active_workspace(space, ws2_id));
-        assert_eq!(manager.active_workspace(space), Some(ws2_id));
+        assert!(manager.set_active_workspace(display, ws2_id));
+        assert_eq!(manager.active_workspace(display), Some(ws2_id));
     }
 
     #[test]
@@ -1053,10 +1097,10 @@ mod tests {
         fn is_window_visible(
             wm: &VirtualWorkspaceManager,
             window_id: WindowId,
-            space: SpaceId,
+            display: DisplayId,
         ) -> bool {
-            let window_workspace = wm.workspace_for_window(space, window_id);
-            let active_workspace = wm.active_workspace(space);
+            let window_workspace = wm.workspace_for_window(display, window_id);
+            let active_workspace = wm.active_workspace(display);
 
             match (window_workspace, active_workspace) {
                 (Some(window_ws), Some(active_ws)) => window_ws == active_ws,
@@ -1064,37 +1108,37 @@ mod tests {
             }
         }
         let mut manager = VirtualWorkspaceManager::new();
-        let space = SpaceId::new(1);
-        let ws1_id = manager.create_workspace(space, Some("WS1".to_string())).unwrap();
-        let ws2_id = manager.create_workspace(space, Some("WS2".to_string())).unwrap();
+        let display = 0usize;
+        let ws1_id = manager.create_workspace(display, Some("WS1".to_string())).unwrap();
+        let ws2_id = manager.create_workspace(display, Some("WS2".to_string())).unwrap();
         let window1 = WindowId::new(1, 1);
         let window2 = WindowId::new(1, 2);
 
-        manager.set_active_workspace(space, ws1_id);
-        manager.assign_window_to_workspace(space, window1, ws1_id);
-        manager.assign_window_to_workspace(space, window2, ws2_id);
+        manager.set_active_workspace(display, ws1_id);
+        manager.assign_window_to_workspace(display, window1, ws1_id);
+        manager.assign_window_to_workspace(display, window2, ws2_id);
 
-        assert!(is_window_visible(&manager, window1, space));
-        assert!(!is_window_visible(&manager, window2, space));
+        assert!(is_window_visible(&manager, window1, display));
+        assert!(!is_window_visible(&manager, window2, display));
 
-        manager.set_active_workspace(space, ws2_id);
-        assert!(!is_window_visible(&manager, window1, space));
-        assert!(is_window_visible(&manager, window2, space));
+        manager.set_active_workspace(display, ws2_id);
+        assert!(!is_window_visible(&manager, window1, display));
+        assert!(is_window_visible(&manager, window2, display));
     }
 
     #[test]
     fn test_workspace_navigation() {
         let mut manager = VirtualWorkspaceManager::new();
-        let space = SpaceId::new(1);
-        let ws1_id = manager.create_workspace(space, Some("WS1".to_string())).unwrap();
-        let ws2_id = manager.create_workspace(space, Some("WS2".to_string())).unwrap();
-        let ws3_id = manager.create_workspace(space, Some("WS3".to_string())).unwrap();
+        let display = 0usize;
+        let ws1_id = manager.create_workspace(display, Some("WS1".to_string())).unwrap();
+        let ws2_id = manager.create_workspace(display, Some("WS2".to_string())).unwrap();
+        let ws3_id = manager.create_workspace(display, Some("WS3".to_string())).unwrap();
 
-        assert_eq!(manager.next_workspace(space, ws1_id, None), Some(ws2_id));
-        assert_eq!(manager.next_workspace(space, ws2_id, None), Some(ws3_id));
+        assert_eq!(manager.next_workspace(display, ws1_id, None), Some(ws2_id));
+        assert_eq!(manager.next_workspace(display, ws2_id, None), Some(ws3_id));
 
-        assert_eq!(manager.prev_workspace(space, ws2_id, None), Some(ws1_id));
-        assert_eq!(manager.prev_workspace(space, ws3_id, None), Some(ws2_id));
+        assert_eq!(manager.prev_workspace(display, ws2_id, None), Some(ws1_id));
+        assert_eq!(manager.prev_workspace(display, ws3_id, None), Some(ws2_id));
     }
 
     #[test]
@@ -1111,13 +1155,13 @@ mod tests {
             ax_subrole: None,
         }];
         let mut manager = VirtualWorkspaceManager::new_with_config(&settings);
-        let space = SpaceId::new(1);
+        let display: DisplayId = 1;
         let window = WindowId::new(42, 7);
 
         let (_, should_float) = manager
             .assign_window_with_app_info(
                 window,
-                space,
+                display,
                 Some("com.example.test"),
                 None,
                 None,
@@ -1126,12 +1170,12 @@ mod tests {
             )
             .unwrap();
         assert!(should_float);
-        assert_eq!(manager.window_rule_floating.get(&(space, window)), Some(&true));
+        assert_eq!(manager.window_rule_floating.get(&(display, window)), Some(&true));
 
         let (_, still_floats) = manager
             .assign_window_with_app_info(
                 window,
-                space,
+                display,
                 Some("com.example.test"),
                 None,
                 None,
@@ -1142,12 +1186,12 @@ mod tests {
         assert!(still_floats);
 
         manager.remove_window(window);
-        assert!(!manager.window_rule_floating.contains_key(&(space, window)));
+        assert!(!manager.window_rule_floating.contains_key(&(display, window)));
 
         let (_, floats_again) = manager
             .assign_window_with_app_info(
                 window,
-                space,
+                display,
                 Some("com.example.test"),
                 None,
                 None,

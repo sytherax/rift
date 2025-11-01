@@ -122,8 +122,14 @@ impl LayoutEngine {
         space: SpaceId,
         workspace_id: VirtualWorkspaceId,
     ) -> EventResponse {
+        // Convert SpaceId to DisplayId for workspace manager operations
+        let display = match self.virtual_workspace_manager.get_display_for_space(space) {
+            Some(d) => d,
+            None => return EventResponse::default(),
+        };
+
         let mut focus_window =
-            self.virtual_workspace_manager.last_focused_window(space, workspace_id);
+            self.virtual_workspace_manager.last_focused_window(display, workspace_id);
 
         if focus_window.is_none() {
             if let Some(layout) = self.workspace_layouts.active(space, workspace_id) {
@@ -143,7 +149,7 @@ impl LayoutEngine {
         if let Some(wid) = focus_window {
             self.focused_window = Some(wid);
             self.virtual_workspace_manager
-                .set_last_focused_window(space, workspace_id, Some(wid));
+                .set_last_focused_window(display, workspace_id, Some(wid));
             if self.floating.is_floating(wid) {
                 self.floating.set_last_focus(Some(wid));
             } else if let Some(layout) = self.workspace_layouts.active(space, workspace_id) {
@@ -152,7 +158,7 @@ impl LayoutEngine {
         } else {
             self.focused_window = None;
             self.virtual_workspace_manager
-                .set_last_focused_window(space, workspace_id, None);
+                .set_last_focused_window(display, workspace_id, None);
         }
 
         EventResponse {
@@ -293,10 +299,13 @@ impl LayoutEngine {
 
     fn space_with_window(&self, wid: WindowId) -> Option<SpaceId> {
         for space in self.workspace_layouts.spaces() {
-            if let Some(ws_id) = self.virtual_workspace_manager.active_workspace(space) {
-                if let Some(layout) = self.workspace_layouts.active(space, ws_id) {
-                    if self.tree.contains_window(layout, wid) {
-                        return Some(space);
+            // Convert SpaceId to DisplayId for workspace manager
+            if let Some(display) = self.virtual_workspace_manager.get_display_for_space(space) {
+                if let Some(ws_id) = self.virtual_workspace_manager.active_workspace(display) {
+                    if let Some(layout) = self.workspace_layouts.active(space, ws_id) {
+                        if self.tree.contains_window(layout, wid) {
+                            return Some(space);
+                        }
                     }
                 }
             }
@@ -312,10 +321,11 @@ impl LayoutEngine {
         &self,
         space_id: SpaceId,
     ) -> Option<(crate::model::VirtualWorkspaceId, String)> {
-        let workspace_id = self.virtual_workspace_manager.active_workspace(space_id)?;
+        let display = self.virtual_workspace_manager.get_display_for_space(space_id)?;
+        let workspace_id = self.virtual_workspace_manager.active_workspace(display)?;
         let workspace_name = self
             .virtual_workspace_manager
-            .workspace_info(space_id, workspace_id)
+            .workspace_info(display, workspace_id)
             .map(|ws| ws.name.clone())
             .unwrap_or_else(|| format!("Workspace {:?}", workspace_id));
         Some((workspace_id, workspace_name))
@@ -352,18 +362,20 @@ impl LayoutEngine {
     pub fn debug_tree(&self, space: SpaceId) { self.debug_tree_desc(space, "", false); }
 
     pub fn debug_tree_desc(&self, space: SpaceId, desc: &'static str, print: bool) {
-        if let Some(workspace_id) = self.virtual_workspace_manager.active_workspace(space) {
-            if let Some(layout) = self.workspace_layouts.active(space, workspace_id) {
-                if print {
-                    println!("Tree {desc}\n{}", self.tree.draw_tree(layout).trim());
+        if let Some(display) = self.virtual_workspace_manager.get_display_for_space(space) {
+            if let Some(workspace_id) = self.virtual_workspace_manager.active_workspace(display) {
+                if let Some(layout) = self.workspace_layouts.active(space, workspace_id) {
+                    if print {
+                        println!("Tree {desc}\n{}", self.tree.draw_tree(layout).trim());
+                    } else {
+                        debug!("Tree {desc}\n{}", self.tree.draw_tree(layout).trim());
+                    }
                 } else {
-                    debug!("Tree {desc}\n{}", self.tree.draw_tree(layout).trim());
+                    debug!("No layout for workspace {workspace_id:?} on space {space:?}");
                 }
             } else {
-                debug!("No layout for workspace {workspace_id:?} on space {space:?}");
+                debug!("No active workspace for space {space:?}");
             }
-        } else {
-            debug!("No active workspace for space {space:?}");
         }
     }
 
@@ -373,8 +385,12 @@ impl LayoutEngine {
             LayoutEvent::SpaceExposed(space, size) => {
                 self.debug_tree(space);
 
+                let display = match self.virtual_workspace_manager.get_display_for_space(space) {
+                    Some(d) => d,
+                    None => return EventResponse::default(),
+                };
                 let workspaces =
-                    self.virtual_workspace_manager_mut().list_workspaces(space).to_vec();
+                    self.virtual_workspace_manager_mut().list_workspaces(display).to_vec();
                 self.workspace_layouts.ensure_active_for_space(
                     space,
                     size,
@@ -384,6 +400,12 @@ impl LayoutEngine {
             }
             LayoutEvent::WindowsOnScreenUpdated(space, pid, mut windows_with_titles, app_info) => {
                 self.debug_tree(space);
+
+                let display = match self.virtual_workspace_manager.get_display_for_space(space) {
+                    Some(d) => d,
+                    None => return EventResponse::default(),
+                };
+
                 self.floating.clear_active_for_app(space, pid);
                 let mut floating_active_accum = Vec::new();
                 windows_with_titles.retain(|(wid, _, _, _)| {
@@ -416,7 +438,7 @@ impl LayoutEngine {
                         .virtual_workspace_manager
                         .assign_window_with_app_info(
                             wid,
-                            space,
+                            display,
                             app_bundle_id,
                             app_name,
                             title_ref,
@@ -425,7 +447,7 @@ impl LayoutEngine {
                         ) {
                         Ok((workspace_id, should_float)) => (workspace_id, should_float),
                         Err(_) => {
-                            match self.virtual_workspace_manager.auto_assign_window(wid, space) {
+                            match self.virtual_workspace_manager.auto_assign_window(wid, display) {
                                 Ok(ws) => (ws, false),
                                 Err(_) => {
                                     tracing::warn!(
@@ -487,13 +509,18 @@ impl LayoutEngine {
             LayoutEvent::WindowAdded(space, wid) => {
                 self.debug_tree(space);
 
+                let display = match self.virtual_workspace_manager.get_display_for_space(space) {
+                    Some(d) => d,
+                    None => return EventResponse::default(),
+                };
+
                 let assigned_workspace =
-                    match self.virtual_workspace_manager.auto_assign_window(wid, space) {
+                    match self.virtual_workspace_manager.auto_assign_window(wid, display) {
                         Ok(workspace_id) => workspace_id,
                         Err(e) => {
                             tracing::warn!("Failed to auto-assign window to workspace: {:?}", e);
                             self.virtual_workspace_manager
-                                .active_workspace(space)
+                                .active_workspace(display)
                                 .expect("No active workspace available")
                         }
                     };
@@ -542,14 +569,16 @@ impl LayoutEngine {
                 } else {
                     let layout = self.layout(space);
                     let _ = self.tree.select_window(layout, wid);
-                    if let Some(workspace_id) =
-                        self.virtual_workspace_manager.active_workspace(space)
-                    {
-                        self.virtual_workspace_manager.set_last_focused_window(
-                            space,
-                            workspace_id,
-                            Some(wid),
-                        );
+                    if let Some(display) = self.virtual_workspace_manager.get_display_for_space(space) {
+                        if let Some(workspace_id) =
+                            self.virtual_workspace_manager.active_workspace(display)
+                        {
+                            self.virtual_workspace_manager.set_last_focused_window(
+                                display,
+                                workspace_id,
+                                Some(wid),
+                            );
+                        }
                     }
                 }
             }
@@ -564,8 +593,10 @@ impl LayoutEngine {
                     let gaps = &self.layout_settings.gaps;
                     self.tree.on_window_resized(layout, wid, old_frame, new_frame, screen, gaps);
 
-                    if let Some(ws) = self.virtual_workspace_manager.active_workspace(space) {
-                        self.workspace_layouts.mark_last_saved(space, ws, layout);
+                    if let Some(display) = self.virtual_workspace_manager.get_display_for_space(space) {
+                        if let Some(ws) = self.virtual_workspace_manager.active_workspace(display) {
+                            self.workspace_layouts.mark_last_saved(space, ws, layout);
+                        }
                     }
                 }
             }
@@ -597,25 +628,27 @@ impl LayoutEngine {
             };
             if is_floating {
                 if let Some(space) = space {
-                    let assigned_workspace = self
-                        .virtual_workspace_manager
-                        .workspace_for_window(space, wid)
-                        .unwrap_or_else(|| {
-                            self.virtual_workspace_manager
-                                .active_workspace(space)
-                                .expect("No active workspace available")
-                        });
+                    if let Some(display) = self.virtual_workspace_manager.get_display_for_space(space) {
+                        let assigned_workspace = self
+                            .virtual_workspace_manager
+                            .workspace_for_window(display, wid)
+                            .unwrap_or_else(|| {
+                                self.virtual_workspace_manager
+                                    .active_workspace(display)
+                                    .expect("No active workspace available")
+                            });
 
-                    if let Some(layout) = self.workspace_layouts.active(space, assigned_workspace) {
-                        self.tree.add_window_after_selection(layout, wid);
-                        tracing::debug!(
-                            "Re-added floating window {:?} to tiling tree in workspace {:?}",
-                            wid,
-                            assigned_workspace
-                        );
+                        if let Some(layout) = self.workspace_layouts.active(space, assigned_workspace) {
+                            self.tree.add_window_after_selection(layout, wid);
+                            tracing::debug!(
+                                "Re-added floating window {:?} to tiling tree in workspace {:?}",
+                                wid,
+                                assigned_workspace
+                            );
+                        }
+
+                        self.floating.remove_active(space, wid.pid, wid);
                     }
-
-                    self.floating.remove_active(space, wid.pid, wid);
                 }
                 self.floating.remove_floating(wid);
                 self.floating.set_last_focus(None);
@@ -634,7 +667,11 @@ impl LayoutEngine {
         let Some(space) = space else {
             return EventResponse::default();
         };
-        let workspace_id = match self.virtual_workspace_manager.active_workspace(space) {
+        let display = match self.virtual_workspace_manager.get_display_for_space(space) {
+            Some(d) => d,
+            None => return EventResponse::default(),
+        };
+        let workspace_id = match self.virtual_workspace_manager.active_workspace(display) {
             Some(id) => id,
             None => {
                 tracing::warn!("No active virtual workspace for space {:?}", space);
@@ -896,44 +933,46 @@ impl LayoutEngine {
 
         let mut positions = HashMap::default();
 
-        if let Some(active_workspace_id) = self.virtual_workspace_manager.active_workspace(space) {
-            if let Some(layout) = self.workspace_layouts.active(space, active_workspace_id) {
-                let tiled_positions = self.tree.calculate_layout(
-                    layout,
+        if let Some(display) = self.virtual_workspace_manager.get_display_for_space(space) {
+            if let Some(active_workspace_id) = self.virtual_workspace_manager.active_workspace(display) {
+                if let Some(layout) = self.workspace_layouts.active(space, active_workspace_id) {
+                    let tiled_positions = self.tree.calculate_layout(
+                        layout,
+                        screen,
+                        self.layout_settings.stack.stack_offset,
+                        &self.layout_settings.gaps,
+                        stack_line_thickness,
+                        stack_line_horiz,
+                        stack_line_vert,
+                    );
+                    for (wid, rect) in tiled_positions {
+                        positions.insert(wid, rect);
+                    }
+                }
+
+                let floating_positions = self
+                    .virtual_workspace_manager
+                    .get_workspace_floating_positions(display, active_workspace_id);
+                for (window_id, stored_position) in floating_positions {
+                    if self.floating.is_floating(window_id) {
+                        positions.insert(window_id, stored_position);
+                    }
+                }
+            }
+
+            let hidden_windows = self.virtual_workspace_manager.windows_in_inactive_workspaces(display);
+            for (index, wid) in hidden_windows.into_iter().enumerate() {
+                let original_size = get_window_size(wid);
+                let app_bundle_id = self.get_app_bundle_id_for_window(wid);
+                let hidden_rect = self.virtual_workspace_manager.calculate_hidden_position(
                     screen,
-                    self.layout_settings.stack.stack_offset,
-                    &self.layout_settings.gaps,
-                    stack_line_thickness,
-                    stack_line_horiz,
-                    stack_line_vert,
+                    index,
+                    original_size,
+                    HideCorner::BottomRight,
+                    app_bundle_id.as_deref(),
                 );
-                for (wid, rect) in tiled_positions {
-                    positions.insert(wid, rect);
-                }
+                positions.insert(wid, hidden_rect);
             }
-
-            let floating_positions = self
-                .virtual_workspace_manager
-                .get_workspace_floating_positions(space, active_workspace_id);
-            for (window_id, stored_position) in floating_positions {
-                if self.floating.is_floating(window_id) {
-                    positions.insert(window_id, stored_position);
-                }
-            }
-        }
-
-        let hidden_windows = self.virtual_workspace_manager.windows_in_inactive_workspaces(space);
-        for (index, wid) in hidden_windows.into_iter().enumerate() {
-            let original_size = get_window_size(wid);
-            let app_bundle_id = self.get_app_bundle_id_for_window(wid);
-            let hidden_rect = self.virtual_workspace_manager.calculate_hidden_position(
-                screen,
-                index,
-                original_size,
-                HideCorner::BottomRight,
-                app_bundle_id.as_deref(),
-            );
-            positions.insert(wid, hidden_rect);
         }
 
         positions.into_iter().collect()
@@ -988,12 +1027,14 @@ impl LayoutEngine {
             }
         }
 
-        let floating_positions = self
-            .virtual_workspace_manager
-            .get_workspace_floating_positions(space, workspace_id);
-        for (window_id, stored_position) in floating_positions {
-            if self.floating.is_floating(window_id) {
-                positions.insert(window_id, stored_position);
+        if let Some(display) = self.virtual_workspace_manager.get_display_for_space(space) {
+            let floating_positions = self
+                .virtual_workspace_manager
+                .get_workspace_floating_positions(display, workspace_id);
+            for (window_id, stored_position) in floating_positions {
+                if self.floating.is_floating(window_id) {
+                    positions.insert(window_id, stored_position);
+                }
             }
         }
 
@@ -1011,16 +1052,19 @@ impl LayoutEngine {
     }
 
     fn layout(&mut self, space: SpaceId) -> LayoutId {
-        let workspace_id = match self.virtual_workspace_manager.active_workspace(space) {
+        let display = self.virtual_workspace_manager.get_display_for_space(space)
+            .expect("No display found for space");
+
+        let workspace_id = match self.virtual_workspace_manager.active_workspace(display) {
             Some(ws) => ws,
             None => {
-                let list = self.virtual_workspace_manager_mut().list_workspaces(space);
+                let list = self.virtual_workspace_manager_mut().list_workspaces(display);
                 if let Some((first_id, _)) = list.first() {
                     *first_id
                 } else {
-                    let _ = self.virtual_workspace_manager.active_workspace(space);
+                    let _ = self.virtual_workspace_manager.active_workspace(display);
                     self.virtual_workspace_manager_mut()
-                        .list_workspaces(space)
+                        .list_workspaces(display)
                         .first()
                         .map(|(id, _)| *id)
                         .expect("No active workspace for space and none could be created")
@@ -1039,7 +1083,7 @@ impl LayoutEngine {
             // reasonable default size so callers of `layout()` won't panic.
             let workspaces = self
                 .virtual_workspace_manager_mut()
-                .list_workspaces(space)
+                .list_workspaces(display)
                 .into_iter()
                 .map(|(id, _)| id);
             let default_size = CGSize::new(1000.0, 1000.0);
@@ -1085,17 +1129,22 @@ impl LayoutEngine {
         space: SpaceId,
         command: &LayoutCommand,
     ) -> EventResponse {
+        let display = match self.virtual_workspace_manager.get_display_for_space(space) {
+            Some(d) => d,
+            None => return EventResponse::default(),
+        };
+
         match command {
             LayoutCommand::NextWorkspace(skip_empty) => {
                 if let Some(current_workspace) =
-                    self.virtual_workspace_manager.active_workspace(space)
+                    self.virtual_workspace_manager.active_workspace(display)
                 {
                     if let Some(next_workspace) = self.virtual_workspace_manager.next_workspace(
-                        space,
+                        display,
                         current_workspace,
                         *skip_empty,
                     ) {
-                        self.virtual_workspace_manager.set_active_workspace(space, next_workspace);
+                        self.virtual_workspace_manager.set_active_workspace(display, next_workspace);
 
                         self.update_active_floating_windows(space);
 
@@ -1109,14 +1158,14 @@ impl LayoutEngine {
             }
             LayoutCommand::PrevWorkspace(skip_empty) => {
                 if let Some(current_workspace) =
-                    self.virtual_workspace_manager.active_workspace(space)
+                    self.virtual_workspace_manager.active_workspace(display)
                 {
                     if let Some(prev_workspace) = self.virtual_workspace_manager.prev_workspace(
-                        space,
+                        display,
                         current_workspace,
                         *skip_empty,
                     ) {
-                        self.virtual_workspace_manager.set_active_workspace(space, prev_workspace);
+                        self.virtual_workspace_manager.set_active_workspace(display, prev_workspace);
 
                         self.update_active_floating_windows(space);
 
@@ -1129,19 +1178,19 @@ impl LayoutEngine {
                 EventResponse::default()
             }
             LayoutCommand::SwitchToWorkspace(workspace_index) => {
-                let workspaces = self.virtual_workspace_manager_mut().list_workspaces(space);
+                let workspaces = self.virtual_workspace_manager_mut().list_workspaces(display);
                 if let Some((workspace_id, _)) = workspaces.get(*workspace_index) {
                     let workspace_id = *workspace_id;
-                    if self.virtual_workspace_manager.active_workspace(space) == Some(workspace_id)
+                    if self.virtual_workspace_manager.active_workspace(display) == Some(workspace_id)
                     {
                         // Check if workspace_auto_back_and_forth is enabled
                         if self.virtual_workspace_manager.workspace_auto_back_and_forth() {
                             // Switch to last workspace instead
                             if let Some(last_workspace) =
-                                self.virtual_workspace_manager.last_workspace(space)
+                                self.virtual_workspace_manager.last_workspace(display)
                             {
                                 self.virtual_workspace_manager
-                                    .set_active_workspace(space, last_workspace);
+                                    .set_active_workspace(display, last_workspace);
                                 self.update_active_floating_windows(space);
                                 self.broadcast_workspace_changed(space);
                                 self.broadcast_windows_changed(space);
@@ -1150,7 +1199,7 @@ impl LayoutEngine {
                         }
                         return EventResponse::default();
                     }
-                    self.virtual_workspace_manager.set_active_workspace(space, workspace_id);
+                    self.virtual_workspace_manager.set_active_workspace(display, workspace_id);
 
                     self.update_active_floating_windows(space);
 
@@ -1174,14 +1223,19 @@ impl LayoutEngine {
                     inferred_space.unwrap_or(space)
                 };
 
-                let workspaces = self.virtual_workspace_manager_mut().list_workspaces(op_space);
+                let op_display = match self.virtual_workspace_manager.get_display_for_space(op_space) {
+                    Some(d) => d,
+                    None => return EventResponse::default(),
+                };
+
+                let workspaces = self.virtual_workspace_manager_mut().list_workspaces(op_display);
                 let Some((target_workspace_id, _)) = workspaces.get(*workspace_index) else {
                     return EventResponse::default();
                 };
                 let target_workspace_id = *target_workspace_id;
 
                 let Some(current_workspace_id) =
-                    self.virtual_workspace_manager.workspace_for_window(op_space, focused_window)
+                    self.virtual_workspace_manager.workspace_for_window(op_display, focused_window)
                 else {
                     return EventResponse::default();
                 };
@@ -1201,7 +1255,7 @@ impl LayoutEngine {
                 }
 
                 let assigned = self.virtual_workspace_manager.assign_window_to_workspace(
-                    op_space,
+                    op_display,
                     focused_window,
                     target_workspace_id,
                 );
@@ -1224,7 +1278,7 @@ impl LayoutEngine {
                     }
                 }
 
-                let active_workspace = self.virtual_workspace_manager.active_workspace(op_space);
+                let active_workspace = self.virtual_workspace_manager.active_workspace(op_display);
 
                 if Some(target_workspace_id) == active_workspace {
                     if is_floating {
@@ -1237,13 +1291,13 @@ impl LayoutEngine {
                 } else if Some(current_workspace_id) == active_workspace {
                     self.focused_window = None;
                     self.virtual_workspace_manager.set_last_focused_window(
-                        op_space,
+                        op_display,
                         current_workspace_id,
                         None,
                     );
 
                     let remaining_windows =
-                        self.virtual_workspace_manager.windows_in_active_workspace(op_space);
+                        self.virtual_workspace_manager.windows_in_active_workspace(op_display);
                     if let Some(&new_focus) = remaining_windows.first() {
                         return EventResponse {
                             focus_window: Some(new_focus),
@@ -1253,7 +1307,7 @@ impl LayoutEngine {
                 }
 
                 self.virtual_workspace_manager.set_last_focused_window(
-                    op_space,
+                    op_display,
                     target_workspace_id,
                     Some(focused_window),
                 );
@@ -1262,7 +1316,7 @@ impl LayoutEngine {
                 EventResponse::default()
             }
             LayoutCommand::CreateWorkspace => {
-                match self.virtual_workspace_manager.create_workspace(space, None) {
+                match self.virtual_workspace_manager.create_workspace(display, None) {
                     Ok(_workspace_id) => {
                         self.broadcast_workspace_changed(space);
                     }
@@ -1273,8 +1327,8 @@ impl LayoutEngine {
                 EventResponse::default()
             }
             LayoutCommand::SwitchToLastWorkspace => {
-                if let Some(last_workspace) = self.virtual_workspace_manager.last_workspace(space) {
-                    self.virtual_workspace_manager.set_active_workspace(space, last_workspace);
+                if let Some(last_workspace) = self.virtual_workspace_manager.last_workspace(display) {
+                    self.virtual_workspace_manager.set_active_workspace(display, last_workspace);
 
                     self.update_active_floating_windows(space);
 
@@ -1297,22 +1351,22 @@ impl LayoutEngine {
         &mut self.virtual_workspace_manager
     }
 
-    pub fn active_workspace(&self, space: SpaceId) -> Option<crate::model::VirtualWorkspaceId> {
-        self.virtual_workspace_manager.active_workspace(space)
+    pub fn active_workspace(&self, display: usize) -> Option<crate::model::VirtualWorkspaceId> {
+        self.virtual_workspace_manager.active_workspace(display)
     }
 
     pub fn workspace_name(
         &self,
-        space: SpaceId,
+        display: usize,
         workspace_id: crate::model::VirtualWorkspaceId,
     ) -> Option<String> {
         self.virtual_workspace_manager
-            .workspace_info(space, workspace_id)
+            .workspace_info(display, workspace_id)
             .map(|ws| ws.name.clone())
     }
 
-    pub fn windows_in_active_workspace(&self, space: SpaceId) -> Vec<WindowId> {
-        self.virtual_workspace_manager.windows_in_active_workspace(space)
+    pub fn windows_in_active_workspace(&self, display: usize) -> Vec<WindowId> {
+        self.virtual_workspace_manager.windows_in_active_workspace(display)
     }
 
     pub fn get_workspace_stats(&self) -> crate::model::virtual_workspace::WorkspaceStats {
@@ -1324,8 +1378,12 @@ impl LayoutEngine {
     }
 
     fn update_active_floating_windows(&mut self, space: SpaceId) {
+        let display = match self.virtual_workspace_manager.get_display_for_space(space) {
+            Some(d) => d,
+            None => return,
+        };
         let windows_in_workspace =
-            self.virtual_workspace_manager.windows_in_active_workspace(space);
+            self.virtual_workspace_manager.windows_in_active_workspace(display);
         self.floating.rebuild_active_for_workspace(space, windows_in_workspace);
     }
 
@@ -1334,8 +1392,12 @@ impl LayoutEngine {
         space: SpaceId,
         floating_positions: &[(WindowId, CGRect)],
     ) {
+        let display = match self.virtual_workspace_manager.get_display_for_space(space) {
+            Some(d) => d,
+            None => return,
+        };
         self.virtual_workspace_manager
-            .store_current_floating_positions(space, floating_positions);
+            .store_current_floating_positions(display, floating_positions);
     }
 
     fn broadcast_workspace_changed(&self, space_id: SpaceId) {
@@ -1357,9 +1419,13 @@ impl LayoutEngine {
             if let Some((workspace_id, workspace_name)) =
                 self.active_workspace_id_and_name(space_id)
             {
+                let display = match self.virtual_workspace_manager.get_display_for_space(space_id) {
+                    Some(d) => d,
+                    None => return,
+                };
                 let windows = self
                     .virtual_workspace_manager
-                    .windows_in_active_workspace(space_id)
+                    .windows_in_active_workspace(display)
                     .iter()
                     .map(|window_id| window_id.to_debug_string())
                     .collect();
@@ -1390,14 +1456,18 @@ impl LayoutEngine {
     }
 
     pub fn debug_log_workspace_state(&self, space: SpaceId) {
-        if let Some(active_workspace) = self.virtual_workspace_manager.active_workspace(space) {
+        let display = match self.virtual_workspace_manager.get_display_for_space(space) {
+            Some(d) => d,
+            None => return,
+        };
+        if let Some(active_workspace) = self.virtual_workspace_manager.active_workspace(display) {
             if let Some(workspace) =
-                self.virtual_workspace_manager.workspace_info(space, active_workspace)
+                self.virtual_workspace_manager.workspace_info(display, active_workspace)
             {
                 let active_windows =
-                    self.virtual_workspace_manager.windows_in_active_workspace(space);
+                    self.virtual_workspace_manager.windows_in_active_workspace(display);
                 let inactive_windows =
-                    self.virtual_workspace_manager.windows_in_inactive_workspaces(space);
+                    self.virtual_workspace_manager.windows_in_inactive_workspaces(display);
 
                 tracing::info!(
                     "Space {:?}: Active workspace '{}' with {} windows",
@@ -1421,13 +1491,17 @@ impl LayoutEngine {
     }
 
     pub fn is_window_in_active_workspace(&self, space: SpaceId, window_id: WindowId) -> bool {
-        let Some(active_workspace_id) = self.virtual_workspace_manager.active_workspace(space)
+        let display = match self.virtual_workspace_manager.get_display_for_space(space) {
+            Some(d) => d,
+            None => return true,
+        };
+        let Some(active_workspace_id) = self.virtual_workspace_manager.active_workspace(display)
         else {
             return true;
         };
 
         if let Some(workspace_id) =
-            self.virtual_workspace_manager.workspace_for_window(space, window_id)
+            self.virtual_workspace_manager.workspace_for_window(display, window_id)
         {
             workspace_id == active_workspace_id
         } else {

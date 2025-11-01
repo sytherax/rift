@@ -395,7 +395,7 @@ impl WindowDiscoveryHandler {
         // Actually, the emit_layout_events should be called after processing, and we need to collect all windows.
 
         let screens = reactor.space_manager.screens.clone();
-        for screen in screens {
+        for (display_idx, screen) in screens.iter().enumerate() {
             let Some(space) = screen.space else { continue };
             let windows_for_space = app_windows.remove(&space).unwrap_or_default();
 
@@ -409,7 +409,7 @@ impl WindowDiscoveryHandler {
                         .virtual_workspace_manager_mut()
                         .assign_window_with_app_info(
                             *wid,
-                            space,
+                            display_idx, // Use display index instead of space
                             app_info.as_ref().and_then(|a| a.bundle_id.as_deref()),
                             app_info.as_ref().and_then(|a| a.localized_name.as_deref()),
                             title_opt.as_deref(),
